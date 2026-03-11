@@ -12,7 +12,7 @@ $$s_j = \sum_{i \,\in\, \text{block}_j} p_i, \qquad p_i = \frac{\exp(q_t k_i^\to
 
 The top-$k$ block indices are then selected:
 
-$$\mathcal{I} = \underset{j \in \{1,\ldots,M\}}{\operatorname{argtop-}k}\, s_j$$
+$$\mathcal{I} = \underset{j \in \{1,\ldots,M\}}{\text{argtop-}k}\, s_j$$
 
 computed by an online Bitonic Sort during the KV iteration with no second pass. The output $\mathcal{I}$ has shape $[B, H, N, k]$ and can drive a subsequent sparse attention pass with $O(k \cdot b)$ KV cost instead of $O(N)$.
 
