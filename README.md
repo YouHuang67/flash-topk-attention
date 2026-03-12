@@ -55,7 +55,7 @@ pip install -e .
 
 ```python
 import torch
-from ops.flash_scoring import flash_scoring_triton
+from flash_topk_attn import flash_topk_score
 
 B, N, H, D = 2, 1024, 8, 64
 C = H * D
@@ -63,7 +63,7 @@ q = torch.randn(B, N, C, device="cuda", dtype=torch.float16)
 k = torch.randn(B, N, C, device="cuda", dtype=torch.float16)
 v = torch.randn(B, N, C, device="cuda", dtype=torch.float16)
 
-o, topk_indices, topk_scores = flash_scoring_triton(
+o, topk_indices, topk_scores = flash_topk_score(
     q, k, v,
     num_heads=H,
     score_block_size=64,  # b: tokens per KV block, must divide N evenly

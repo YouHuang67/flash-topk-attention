@@ -43,7 +43,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["ops*", "tests*"]
+include = ["flash_topk_attn*", "tests*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
