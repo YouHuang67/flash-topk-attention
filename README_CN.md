@@ -2,11 +2,11 @@
 
 # Flash TopK Attention
 
-融合 Flash Attention 与 $\text{top-}k$ KV block 选择的 Triton 内核，在计算注意力输出的同时对每个 query 的 KV block 按聚合注意力概率打分，返回 $\text{top-}k$ block 索引，可用于下游稀疏注意力或注意力模式分析。
+融合 Flash Attention 与 $\text{top-}k$ KV block 打分的 Triton 内核，在计算注意力输出的同时对每个 query 的 KV block 按聚合注意力概率打分，返回 $\text{top-}k$ block 索引，可用于下游稀疏注意力或注意力模式分析。
 
 ## 算法
 
-标准 Flash Attention 利用 online softmax 技巧计算 $O = \text{softmax}(QK^\top / \sqrt{D})\,V$，通过逐 block 迭代 KV 避免展开完整的 $N \times N$ 矩阵。其中 $B$ 为 batch size，$N$ 为序列长度，$H$ 为注意力头数，$D$ 为每头维度。
+标准 Flash Attention 利用 online softmax 技巧计算 $O = \text{softmax}(QK^\top / \sqrt{D})\,V$，通过逐 block 迭代 KV 避免展开完整的 $N \times N$ 矩阵。其中 $B$ 为 batch size, $N$ 为序列长度, $H$ 为注意力头数, $D$ 为每头维度。
 
 本内核在此基础上将 KV 序列划分为 $M = N / b$ 个不重叠的 block，每个 block 大小为 $b$，并为每个 block $j$ 计算**块级注意力分数**：
 
