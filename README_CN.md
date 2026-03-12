@@ -6,19 +6,17 @@
 
 ## 算法
 
-标准 Flash Attention 利用 online softmax 技巧计算 $O = \text{softmax}(QK^\top / \sqrt{D})\,V$，通过逐 block 迭代 KV 避免展开完整的 $N \times N$ 矩阵。其中 $B$ 为 batch size, $N$ 为序列长度, $H$ 为注意力头数, $D$ 为每头维度。
+标准 Flash Attention 利用 online softmax 技巧计算 $O = \text{softmax}(QK^\top / \sqrt{D})\ V$，通过逐 block 迭代 KV 避免展开完整的 $N \times N$ 矩阵。其中 $B$ 为 batch size, $N$ 为序列长度, $H$ 为注意力头数, $D$ 为每头维度。
 
 本内核在此基础上将 KV 序列划分为 $M = N / b$ 个不重叠的 block，每个 block 大小为 $b$，并为每个 block $j$ 计算**块级注意力分数**：
 
-$$s_j = \sum_{i \,\in\, \text{block}_j} p_i, \qquad p_i = \frac{\exp(q_t k_i^\top / \sqrt{D})}{\sum_{l=1}^{N} \exp(q_t k_l^\top / \sqrt{D})}.$$
+$$s_j = \sum_{i \ \in\  \text{block}_j} p_i, \qquad p_i = \frac{\exp(q_t k_i^\top / \sqrt{D})}{\sum_{l=1}^{N} \exp(q_t k_l^\top / \sqrt{D})}.$$
 
 随后选取分数最高的 $\text{top-}k$ 个 block 索引：
 
 $$\mathbf{I} = \underset{j \in \{1,\ldots,M\}}{\text{argtop-}k}\ s_j,$$
 
-在 KV 迭代过程中通过在线 Bitonic Sort 维护 top-$k$ 池完成选取，无需对 KV 进行第二次遍历。输出 $\mathbf{I}$ 的形状为 $[B, H, N, k]$，可驱动后续稀疏注意力计算，将每 token 的 KV 访问量从 $O(N)$ 降至 $O(k \cdot b)$。
-
-详细推导见 [algorithm.md](algorithm.md)。
+在 KV 迭代过程中通过在线 Bitonic Sort 维护 $\text{top-}k$ 池完成选取，无需对 KV 进行第二次遍历。输出 $\mathbf{I}$ 的形状为 $[B, H, N, k]$，可驱动后续稀疏注意力计算，将每 token 的 KV 访问量从 $O(N)$ 降至 $O(k \cdot b)$。
 
 ## 性能
 
@@ -33,7 +31,7 @@ $$\mathbf{I} = \underset{j \in \{1,\ldots,M\}}{\text{argtop-}k}\ s_j,$$
 | 65,536 | 4 | 1,024 | 16 | — | 1.52x 减速 |
 | 262,144 | 4 | 4,096 | 16 | — | 1.57x 减速 |
 
-Naive 需要展开完整的 $N \times N$ 注意力矩阵，在长序列下既无法计算 block 分数也无法找到 top-$k$ 索引。
+Naive 需要展开完整的 $N \times N$ 注意力矩阵，在长序列下会导致 GPU 显存不足 (OOM)，既无法计算 block 分数也无法找到 $\text{top-}k$ 索引。
 
 完整 benchmark 数据：[BENCHMARK_CN.md](BENCHMARK_CN.md)
 

@@ -6,19 +6,17 @@ A fused Flash Attention kernel that computes attention output while scoring each
 
 ## Algorithm
 
-Standard Flash Attention computes $O = \text{softmax}(QK^\top / \sqrt{D})\,V$ using the online softmax trick, iterating over KV blocks without materializing the full $N \times N$ matrix. Here $B$ is batch size, $N$ is sequence length, $H$ is number of heads, and $D$ is head dimension.
+Standard Flash Attention computes $O = \text{softmax}(QK^\top / \sqrt{D})\ V$ using the online softmax trick, iterating over KV blocks without materializing the full $N \times N$ matrix. Here $B$ is batch size, $N$ is sequence length, $H$ is number of heads, and $D$ is head dimension.
 
 This kernel additionally partitions the KV sequence into $M = N / b$ non-overlapping blocks of size $b$, and computes a **block-level attention score** for each block $j$:
 
-$$s_j = \sum_{i \,\in\, \text{block}_j} p_i, \qquad p_i = \frac{\exp(q_t k_i^\top / \sqrt{D})}{\sum_{l=1}^{N} \exp(q_t k_l^\top / \sqrt{D})}.$$
+$$s_j = \sum_{i \ \in\  \text{block}_j} p_i, \qquad p_i = \frac{\exp(q_t k_i^\top / \sqrt{D})}{\sum_{l=1}^{N} \exp(q_t k_l^\top / \sqrt{D})}.$$
 
 The $\text{top-}k$ block indices are then selected:
 
 $$\mathbf{I} = \underset{j \in \{1,\ldots,M\}}{\text{argtop-}k}\ s_j,$$
 
 computed by an online Bitonic Sort during the KV iteration with no second pass. The output $\mathbf{I}$ has shape $[B, H, N, k]$ and can drive a subsequent sparse attention pass with $O(k \cdot b)$ KV cost instead of $O(N)$.
-
-See [algorithm.md](algorithm.md) for a detailed derivation combining Flash Attention 2 with the single-pass block scoring mechanism.
 
 ## Performance
 
@@ -33,7 +31,7 @@ Baselines: **Naive** = standard attention + `torch.topk` (two separate passes); 
 | 65,536 | 4 | 1,024 | 16 | — | 1.52x slower |
 | 262,144 | 4 | 4,096 | 16 | — | 1.57x slower |
 
-Naive materializes the full $N \times N$ attention matrix, making it infeasible at long sequences where computing block scores or finding top-$k$ indices is impossible within memory limits.
+Naive materializes the full $N \times N$ attention matrix, causing GPU out-of-memory (OOM) at long sequences — computing block scores or finding $\text{top-}k$ indices becomes impossible.
 
 Full benchmark results: [BENCHMARK.md](BENCHMARK.md)
 
