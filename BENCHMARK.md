@@ -1,6 +1,6 @@
-# Benchmark
+English | [中文](BENCHMARK_CN.md)
 
-**Hardware:** NVIDIA RTX 3090 · **Precision:** float16 · **Software:** PyTorch 2.6.0, Triton 3.2.0
+# Benchmark
 
 ### Baselines
 
@@ -22,7 +22,7 @@
 | Extra Large | 16384 – 32768 | 14 | — | 3.20× |
 | Ultra Large | 32768 – 470016 | 33 | — | 2.88× |
 
-> Naive baseline was too slow to run for sequences beyond 16384 (SKIPPED in raw results).
+> Naive baseline ran out of GPU memory (OOM) for sequences beyond 16384 and could not be executed (SKIPPED in raw results).
 
 ---
 
@@ -54,6 +54,8 @@ Non-power-of-2 block sizes incur extra overhead from padding and boundary handli
 ---
 
 ## Full Results
+
+> SKIPPED: Naive baseline ran out of GPU memory (OOM) and could not be executed.
 
 ```
 Scale        | Batch | Seq Len | Heads | Block Size | Top-K | Naive (ms) |  FA2 (ms) | Scoring (ms) | Scoring / FA2
