@@ -70,6 +70,7 @@ o, topk_indices, topk_scores = flash_topk_score(
 # o:             [B, N, C]
 # topk_indices:  [B, H, N, 16]  int32, descending by score
 # topk_scores:   [B, H, N, 16]  float32, normalized block attention weights
+# Supported dtypes: float16, bfloat16, float32
 ```
 
 ## Todo
