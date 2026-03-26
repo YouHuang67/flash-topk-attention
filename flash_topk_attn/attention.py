@@ -384,15 +384,19 @@ def _flash_topk_attn_naive(
     if bi.shape[1] == 1 and H > 1:
         bi = bi.expand(B, H, N, topk)
 
-    # [B, H, N, topk] -> for each (b,h,n), which block ids are selected
-    # valid[b,h,n,j] = (j // block_size) is in bi[b,h,n,:]
+    # [B, H, N, topk] -> for each (b,h,n), which block ids are selected.
+    # -1 means empty slot and should not match any kv block.
     kv_block_id = torch.arange(N, device=q.device, dtype=torch.long) // block_size
-    # [N] vs [B,H,N,topk] -> [B,H,N,N]: for each j, is kv_block_id[j] in bi[b,h,n,:]?
-    valid = (bi[..., None] == kv_block_id[None, None, None, :]).any(dim=-2)
+    valid_slot = bi >= 0
+    match = bi[..., None] == kv_block_id[None, None, None, :]
+    valid = (match & valid_slot[..., None]).any(dim=-2)
+    has_any = valid.any(dim=-1, keepdim=True)
 
     scores = torch.einsum("bhqd,bhkd->bhqk", q * scale, k)
     scores = scores.masked_fill(~valid, float("-inf"))
-    attn = torch.softmax(scores, dim=-1)
+    safe_scores = torch.where(has_any, scores, torch.zeros_like(scores))
+    attn = torch.softmax(safe_scores, dim=-1)
+    attn = torch.where(has_any, attn, torch.zeros_like(attn))
     o = torch.einsum("bhqk,bhkd->bhqd", attn, v)
 
     o = rearrange(o, "b h n d -> b n (h d)")
