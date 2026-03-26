@@ -288,10 +288,10 @@ class _FlashTopKAttnFunc(torch.autograd.Function):
         _ = ctx.saved_tensors
         _ = ctx.meta
         _ = do
-        raise NotImplementedError("flash_topk_attn backward is not implemented yet")
+        raise NotImplementedError("flash_topk_attn_per_query backward is not implemented yet")
 
 
-def flash_topk_attn(
+def flash_topk_attn_per_query(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block_indices: torch.Tensor,
     num_heads: int, block_size: int = 64,
     scale: Optional[float] = None, num_kv_heads: Optional[int] = None,
@@ -342,7 +342,7 @@ def flash_topk_attn(
     return _FlashTopKAttnFunc.apply(q, k, v, block_indices, num_heads, block_size, scale)
 
 
-def _flash_topk_attn_naive(
+def _flash_topk_attn_per_query_naive(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block_indices: torch.Tensor,
     num_heads: int, block_size: int, scale: Optional[float] = None,
 ) -> torch.Tensor:
