@@ -38,7 +38,7 @@ def _reverse_attn_stage1_kernel(
     q_ptr, k_ptr, v_ptr,
     sorted_flat_idx_ptr, block_offsets_ptr,
     mid_o_ptr, mid_lse_ptr,
-    stride_q_b, stride_q_t, stride_q_h, stride_q_d,
+    stride_q_b, stride_q_h, stride_q_t, stride_q_d,
     stride_k_b, stride_k_t, stride_k_h, stride_k_d,
     stride_v_b, stride_v_t, stride_v_h, stride_v_d,
     stride_sf_b, stride_sf_h,
@@ -413,10 +413,10 @@ def flash_topk_attn_reverse_index_chunked(
     chunk_size = min(chunk_size, topk)
     chunk_size = max(1, chunk_size)
 
-    q_h = q.view(B, N, H, D)
+    q_h = q.view(B, N, H, D).permute(0, 2, 1, 3).contiguous()
     k_h = k.view(B, N, H, D)
     v_h = v.view(B, N, H, D)
-    o_h = torch.empty_like(q_h)
+    o_h = torch.empty(B, N, H, D, device=q.device, dtype=q.dtype)
     lse = torch.empty(B, H, N, device=q.device, dtype=torch.float32)
 
     if chunk_size >= topk:
@@ -429,7 +429,8 @@ def flash_topk_attn_reverse_index_chunked(
             q_h, k_h, v_h,
             sorted_flat_idx, block_offsets,
             mid_o, mid_lse,
-            *q_h.stride(), *k_h.stride(), *v_h.stride(),
+            *q_h.stride(),
+            *k_h.stride(), *v_h.stride(),
             sorted_flat_idx.stride(0), sorted_flat_idx.stride(1),
             block_offsets.stride(0), block_offsets.stride(1),
             *mid_o.stride(), *mid_lse.stride(),
@@ -482,7 +483,8 @@ def flash_topk_attn_reverse_index_chunked(
             q_h, k_h, v_h,
             sf_chunk, bo_chunk,
             mid_o, mid_lse,
-            *q_h.stride(), *k_h.stride(), *v_h.stride(),
+            *q_h.stride(),
+            *k_h.stride(), *v_h.stride(),
             sf_chunk.stride(0), sf_chunk.stride(1),
             bo_chunk.stride(0), bo_chunk.stride(1),
             *mid_o.stride(), *mid_lse.stride(),
