@@ -26,7 +26,7 @@ $$\mathbf{I} = \underset{j \in \{1,\ldots,M\}}{\text{argtop-}k}\ s_j,$$
 
 **Q-Block 共享候选机制**：将 query 按大小 $g$（`q_block_size`）分组。对于第 $m$ 个 query 块 $\mathcal{Q}_m = \{q_{mg}, q_{mg+1}, \ldots, q_{(m+1)g-1}\}$，取组内所有 query 的 top-k 索引的并集，构造共享候选集：
 
-$$\mathcal{C}_m = \bigcup_{q \in \mathcal{Q}_m} \text{topk\_blocks}(q)$$
+$$\mathcal{C}_m = \bigcup_{q \in \mathcal{Q}_m} \mathrm{TopK}(q)$$
 
 候选按 block id 升序排列：$\mathcal{C}_m = \{c_0, c_1, \ldots, c_{L_m-1}\}$，其中 $c_i < c_{i+1}$，$L_m = |\mathcal{C}_m| \leq g \cdot k$。
 
