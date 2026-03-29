@@ -22,12 +22,20 @@ $$\mathbf{I} = \underset{j \in \{1,\ldots,M\}}{\text{argtop-}k}\ s_j,$$
 
 ### 稀疏注意力（Sparse Attention）
 
-基于打分阶段得到的 $\text{top-}k$ block 索引，`flash_topk_attn` 仅对选中的 KV block 计算注意力。
+基于打分阶段得到的 $\text{top-}k$ block 索引 $\mathbf{I}$，`flash_topk_attn` 仅对选中的 KV block 计算注意力。
 
-**Q-Block 共享候选机制**：将 query 按 `q_block_size` 分组，组内所有 query 的 $\text{top-}k$ 索引取并集，形成共享候选集。组内所有 query 对该共享集计算注意力，实现高效的批量 KV 访问。
+**Q-Block 共享候选机制**：将 query 按大小 $g$（`q_block_size`）分组。对于第 $m$ 个 query 块 $\mathcal{Q}_m = \{q_{mg}, q_{mg+1}, \ldots, q_{(m+1)g-1}\}$，取组内所有 query 的 top-k 索引的并集，构造共享候选集：
 
-- `q_block_size=1`：等价于 per-query 稀疏注意力（每个 query 仅访问自己的 top-k blocks）
-- `q_block_size>1`：query 共享候选，降低索引开销，但注意力范围略有扩大
+$$\mathcal{C}_m = \bigcup_{q \in \mathcal{Q}_m} \text{topk\_blocks}(q)$$
+
+候选按 block id 升序排列：$\mathcal{C}_m = \{c_0, c_1, \ldots, c_{L_m-1}\}$，其中 $c_i < c_{i+1}$，$L_m = |\mathcal{C}_m| \leq g \cdot k$。
+
+组内每个 query $q_t \in \mathcal{Q}_m$ 对**整个**共享候选集 $\mathcal{C}_m$ 计算注意力：
+
+$$O_t = \sum_{j \in \mathcal{C}_m} \frac{\exp(q_t k_j^\top / \sqrt{D})}{\sum_{j' \in \mathcal{C}_m} \exp(q_t k_{j'}^\top / \sqrt{D})} \cdot v_j$$
+
+- $g=1$：每个 query 仅访问自己的 top-k blocks（per-query 稀疏注意力）
+- $g>1$：query 共享候选，实现批量 KV 访问，但每个 query 的注意力范围略有扩大
 
 ## 性能
 

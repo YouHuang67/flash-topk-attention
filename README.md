@@ -22,12 +22,20 @@ computed by an online Bitonic Sort during the KV iteration with no second pass. 
 
 ### Sparse Attention
 
-Given the top-k block indices from scoring, `flash_topk_attn` computes sparse attention over selected KV blocks only.
+Given the top-k block indices $\mathbf{I}$ from scoring, `flash_topk_attn` computes sparse attention over selected KV blocks only.
 
-**Q-Block Shared Candidates**: Queries are grouped into blocks of size `q_block_size`. Within each group, the union of all queries' top-k indices forms a shared candidate set. All queries in the group attend over this shared set, enabling efficient batched KV access.
+**Q-Block Shared Candidates**: Queries are grouped into blocks of size $g$ (`q_block_size`). For the $m$-th query block $\mathcal{Q}_m = \{q_{mg}, q_{mg+1}, \ldots, q_{(m+1)g-1}\}$, we construct a shared candidate set by taking the union of all queries' top-k indices:
 
-- When `q_block_size=1`: equivalent to per-query sparse attention (each query attends only to its own top-k blocks)
-- When `q_block_size>1`: queries share candidates, reducing index overhead but slightly expanding the attention scope
+$$\mathcal{C}_m = \bigcup_{q \in \mathcal{Q}_m} \text{topk\_blocks}(q)$$
+
+The candidates are sorted in ascending order: $\mathcal{C}_m = \{c_0, c_1, \ldots, c_{L_m-1}\}$ where $c_i < c_{i+1}$ and $L_m = |\mathcal{C}_m| \leq g \cdot k$.
+
+Each query $q_t \in \mathcal{Q}_m$ attends over the **entire** shared set $\mathcal{C}_m$:
+
+$$O_t = \sum_{j \in \mathcal{C}_m} \frac{\exp(q_t k_j^\top / \sqrt{D})}{\sum_{j' \in \mathcal{C}_m} \exp(q_t k_{j'}^\top / \sqrt{D})} \cdot v_j$$
+
+- When $g=1$: each query attends only to its own top-k blocks (per-query sparse attention)
+- When $g>1$: queries share candidates, enabling batched KV access but slightly expanding each query's attention scope
 
 ## Performance
 
