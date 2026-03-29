@@ -2,9 +2,11 @@ English | [中文](README_CN.md)
 
 # Flash TopK Attention
 
-A fused Flash Attention kernel that computes attention output while scoring each KV block by its aggregated attention probability per query, returning the $\text{top-}k$ block indices for downstream sparse attention or attention pattern analysis.
+A fused Triton kernel for Flash Attention with top-k KV block scoring and sparse attention. Computes attention output while scoring each KV block by its aggregated attention probability, returning top-k block indices for downstream sparse attention.
 
 ## Algorithm
+
+### Scoring
 
 Standard Flash Attention computes $O = \text{softmax}(QK^\top / \sqrt{D})\ V$ using the online softmax trick, iterating over KV blocks without materializing the full $N \times N$ matrix. Here $B$ is batch size, $N$ is sequence length, $H$ is number of heads, and $D$ is head dimension.
 
@@ -17,6 +19,15 @@ The $\text{top-}k$ block indices are then selected:
 $$\mathbf{I} = \underset{j \in \{1,\ldots,M\}}{\text{argtop-}k}\ s_j,$$
 
 computed by an online Bitonic Sort during the KV iteration with no second pass. The output $\mathbf{I}$ has shape $[B, H, N, k]$ and can drive a subsequent sparse attention pass with $O(k \cdot b)$ KV cost instead of $O(N)$.
+
+### Sparse Attention
+
+Given the top-k block indices from scoring, `flash_topk_attn` computes sparse attention over selected KV blocks only.
+
+**Q-Block Shared Candidates**: Queries are grouped into blocks of size `q_block_size`. Within each group, the union of all queries' top-k indices forms a shared candidate set. All queries in the group attend over this shared set, enabling efficient batched KV access.
+
+- When `q_block_size=1`: equivalent to per-query sparse attention (each query attends only to its own top-k blocks)
+- When `q_block_size>1`: queries share candidates, reducing index overhead but slightly expanding the attention scope
 
 ## Performance
 
@@ -51,6 +62,8 @@ pip install -e .
 
 ## Usage
 
+### Scoring
+
 ```python
 import torch
 from flash_topk_attn import flash_topk_score
@@ -67,16 +80,41 @@ o, topk_indices, topk_scores = flash_topk_score(
     score_block_size=64,  # b: tokens per KV block, must divide N evenly
     topk=16,              # k: top blocks per query, must satisfy k <= N // b
 )
-# o:             [B, N, C]
-# topk_indices:  [B, H, N, 16]  int32, descending by score
-# topk_scores:   [B, H, N, 16]  float32, normalized block attention weights
+# o:             [B, N, C]       full attention output
+# topk_indices:  [B, H, N, 16]   int32, descending by score
+# topk_scores:   [B, H, N, 16]   float32, normalized block attention weights
 # Supported dtypes: float16, bfloat16, float32
+```
+
+### Sparse Attention
+
+```python
+from flash_topk_attn import flash_topk_score, flash_topk_attn
+
+# Step 1: Scoring — get top-k block indices per query
+o_full, topk_indices, topk_scores = flash_topk_score(
+    q, k, v,
+    num_heads=H,
+    score_block_size=64,
+    topk=16,
+)
+
+# Step 2: Sparse Attention — attend only to selected blocks
+o_sparse, lse = flash_topk_attn(
+    q, k, v,
+    topk_indices,
+    num_heads=H,
+    q_block_size=32,   # queries per shared-candidate group
+    kv_block_size=64,  # must match score_block_size
+)
+# o_sparse:  [B, N, C]   sparse attention output
+# lse:       [B, H, N]   log-sum-exp (float32)
 ```
 
 ## Todo
 
-- [x] Flash Scoring kernel (forward + backward)
-- [ ] Sparse Attention kernel
+- [x] Flash Scoring kernel
+- [x] Sparse Attention kernel
 
 ## License
 
