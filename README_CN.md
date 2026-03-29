@@ -24,13 +24,13 @@ $$\mathbf{I} = \underset{j \in \{1,\ldots,M\}}{\text{argtop-}k}\ s_j,$$
 
 基于打分阶段得到的 $\text{top-}k$ block 索引 $\mathbf{I}$，`flash_topk_attn` 仅对选中的 KV block 计算注意力。
 
-**Q-Block 共享候选机制**：将 query 按大小 $g$（`q_block_size`）分组。对于第 $m$ 个 query 块 $\mathcal{Q}_m = \{q_{mg}, q_{mg+1}, \ldots, q_{(m+1)g-1}\}$，取组内所有 query 的 top-k 索引的并集，构造共享候选集：
+**Q-Block 共享候选机制**：将 query 按大小 $g$（`q_block_size`）分组。对于第 $m$ 个 query 块（覆盖 query $[mg,\ (m+1)g)$），取组内所有 query 的 top-k 索引的并集，构造共享候选集：
 
-$$\mathcal{C}_m = \bigcup_{q \in \mathcal{Q}_m} \mathrm{TopK}(q)$$
+$$\mathcal{C}_m = \bigcup_{t=mg}^{(m+1)g-1} \mathrm{TopK}(q_t)$$
 
-候选按 block id 升序排列：$\mathcal{C}_m = \{c_0, c_1, \ldots, c_{L_m-1}\}$，其中 $c_i < c_{i+1}$，$L_m = |\mathcal{C}_m| \leq g \cdot k$。
+候选按 block id 升序排列，记 $L_m = |\mathcal{C}_m| \leq g \cdot k$。
 
-组内每个 query $q_t \in \mathcal{Q}_m$ 对**整个**共享候选集 $\mathcal{C}_m$ 计算注意力：
+组内每个 query $q_t$ 对**整个**共享候选集 $\mathcal{C}_m$ 计算注意力：
 
 $$O_t = \sum_{j \in \mathcal{C}_m} \frac{\exp(q_t k_j^\top / \sqrt{D})}{\sum_{j' \in \mathcal{C}_m} \exp(q_t k_{j'}^\top / \sqrt{D})} \cdot v_j$$
 
