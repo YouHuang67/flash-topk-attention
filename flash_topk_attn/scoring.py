@@ -73,24 +73,30 @@ MAX_KV_BS_IN_CONFIGS = 128
 MAX_ALLOWED_ENTRIES_PER_KV = 16
 
 
-def _prune_configs(configs, named_args, **kwargs):
-    """Prune invalid KV_BS/SCORE_BS combinations.
-
-    Constraints:
-        1. KV_BS and SCORE_BS must be divisible (larger by smaller).
-        2. ENTRIES_PER_KV = KV_BS // SCORE_BS <= MAX_ALLOWED_ENTRIES_PER_KV.
-           This ensures pool's HALF_POOL can accommodate all entries from one KV block.
-    """
-    SCORE_BS = kwargs.get('SCORE_BS', named_args.get('SCORE_BS'))
-    valid = []
-    for cfg in configs:
-        kv_bs = cfg.kwargs['KV_BS']
-        if max(kv_bs, SCORE_BS) % min(kv_bs, SCORE_BS) != 0:
-            continue
-        if kv_bs > SCORE_BS and kv_bs // SCORE_BS > MAX_ALLOWED_ENTRIES_PER_KV:
-            continue
-        valid.append(cfg)
-    return valid
+def _topk_scores_avg_normalize(
+    topk_scores: torch.Tensor,
+    topk_indices: torch.Tensor,
+    pad_head: int,
+    pad_tail: int,
+    n_padded: int,
+    score_bs_orig: int,
+    n: int,
+) -> torch.Tensor:
+    """Scale block mass scores to be comparable across full vs partial blocks (virtual padding)."""
+    if pad_head == 0 and pad_tail == 0:
+        return topk_scores
+    num_blocks = n_padded // score_bs_orig
+    if num_blocks == 1:
+        return topk_scores * (float(score_bs_orig) / float(n))
+    c_first = float(score_bs_orig - pad_head)
+    c_last = float(score_bs_orig - pad_tail)
+    c_mid = float(score_bs_orig)
+    count = torch.where(
+        topk_indices == 0,
+        c_first,
+        torch.where(topk_indices == num_blocks - 1, c_last, c_mid),
+    )
+    return topk_scores * (float(score_bs_orig) / count)
 
 
 @triton.autotune(
@@ -98,8 +104,7 @@ def _prune_configs(configs, named_args, **kwargs):
         triton.Config({'Q_BS': q, 'KV_BS': kv}, num_warps=4 if q < 64 else 8)
         for q in [16, 32, 64] for kv in [16, 32, 64, 128]
     ],
-    key=['N', 'SCORE_K', 'SCORE_BS', 'SCORE_BS_ORIG', 'IS_POW2'],
-    prune_configs_by={'early_config_prune': _prune_configs},
+    key=['N', 'N_PADDED', 'SCORE_K', 'SCORE_BS', 'SCORE_BS_ORIG', 'IS_POW2'],
 )
 @triton.jit
 def flash_scoring_kernel(
@@ -109,6 +114,7 @@ def flash_scoring_kernel(
     IS_POW2: tl.constexpr,
     SCORE_BS: tl.constexpr, SCORE_BS_ORIG: tl.constexpr,
     SCORE_K: tl.constexpr, SCORE_POOL: tl.constexpr,
+    PAD_HEAD: tl.constexpr, PAD_TAIL: tl.constexpr, N_PADDED: tl.constexpr,
     stride_q_b, stride_q_n, stride_q_h, stride_q_d,
     stride_k_b, stride_k_n, stride_k_h, stride_k_d,
     stride_v_b, stride_v_n, stride_v_h, stride_v_d,
@@ -147,24 +153,28 @@ def flash_scoring_kernel(
     n_dims_merge: tl.constexpr = int(math.log2(SCORE_POOL))
 
     if IS_POW2:
-        num_kv_blocks: tl.constexpr = (N + KV_BS - 1) // KV_BS
+        num_kv_blocks: tl.constexpr = (N_PADDED + KV_BS - 1) // KV_BS
 
         p_k = tl.make_block_ptr(
             base=K + i_b * stride_k_b + i_h * stride_k_h,
             shape=(D, N), strides=(stride_k_d, stride_k_n),
-            offsets=(0, 0), block_shape=(D, KV_BS), order=(0, 1),
+            offsets=(0, -PAD_HEAD), block_shape=(D, KV_BS), order=(0, 1),
         )
         p_v = tl.make_block_ptr(
             base=V + i_b * stride_v_b + i_h * stride_v_h,
             shape=(N, D), strides=(stride_v_n, stride_v_d),
-            offsets=(0, 0), block_shape=(KV_BS, D), order=(1, 0),
+            offsets=(-PAD_HEAD, 0), block_shape=(KV_BS, D), order=(1, 0),
         )
 
         for i_block in range(num_kv_blocks):
             k = tl.load(p_k, boundary_check=(0, 1))
             s = tl.dot(q, k)
             kv_idx = tl.arange(0, KV_BS)
-            s = tl.where((i_block * KV_BS + kv_idx)[None, :] < N, s, NEG_INF)
+            if PAD_HEAD > 0 or PAD_TAIL > 0:
+                real_pos = i_block * KV_BS + kv_idx - PAD_HEAD
+                s = tl.where((real_pos[None, :] >= 0) & (real_pos[None, :] < N), s, NEG_INF)
+            else:
+                s = tl.where((i_block * KV_BS + kv_idx)[None, :] < N, s, NEG_INF)
 
             m_local = tl.max(s, axis=1)
             m_prev = m_global
@@ -268,7 +278,7 @@ def flash_scoring_kernel(
 
         if CASE_LARGE:
             KV_ITERS_PER_BLOCK: tl.constexpr = (SCORE_BS_ORIG + KV_BS - 1) // KV_BS
-            num_score_blocks: tl.constexpr = N // SCORE_BS_ORIG
+            num_score_blocks: tl.constexpr = N_PADDED // SCORE_BS_ORIG
             num_kv_iters: tl.constexpr = num_score_blocks * KV_ITERS_PER_BLOCK
 
             k_base = K + i_b * stride_k_b + i_h * stride_k_h
@@ -277,19 +287,26 @@ def flash_scoring_kernel(
             for i_kv in range(num_kv_iters):
                 block_idx = i_kv // KV_ITERS_PER_BLOCK
                 sub_iter = i_kv % KV_ITERS_PER_BLOCK
-                block_base = block_idx * SCORE_BS_ORIG
-                offset_in_block = sub_iter * KV_BS
+                block_base = block_idx * SCORE_BS_ORIG - PAD_HEAD
+                local_off = sub_iter * KV_BS
+                global_off = block_base + local_off
 
                 p_k = tl.make_block_ptr(
-                    base=k_base + block_base * stride_k_n,
-                    shape=(D, SCORE_BS_ORIG), strides=(stride_k_d, stride_k_n),
-                    offsets=(0, offset_in_block), block_shape=(D, KV_BS), order=(0, 1),
+                    base=k_base,
+                    shape=(D, N), strides=(stride_k_d, stride_k_n),
+                    offsets=(0, global_off),
+                    block_shape=(D, KV_BS), order=(0, 1),
                 )
-                k = tl.load(p_k, boundary_check=(1,))
+                k = tl.load(p_k, boundary_check=(0, 1))
                 s = tl.dot(q, k)
 
                 kv_idx = tl.arange(0, KV_BS)
-                valid_mask = (offset_in_block + kv_idx) < SCORE_BS_ORIG
+                intra_valid = (local_off + kv_idx) < SCORE_BS_ORIG
+                if PAD_HEAD > 0 or PAD_TAIL > 0:
+                    kv_global = global_off + kv_idx
+                    valid_mask = intra_valid & (kv_global >= 0) & (kv_global < N)
+                else:
+                    valid_mask = intra_valid
                 s = tl.where(valid_mask[None, :], s, NEG_INF)
 
                 m_local = tl.max(s, axis=1)
@@ -306,11 +323,12 @@ def flash_scoring_kernel(
                 l_global = l_global + l_local
 
                 p_v = tl.make_block_ptr(
-                    base=v_base + block_base * stride_v_n,
-                    shape=(SCORE_BS_ORIG, D), strides=(stride_v_n, stride_v_d),
-                    offsets=(offset_in_block, 0), block_shape=(KV_BS, D), order=(1, 0),
+                    base=v_base,
+                    shape=(N, D), strides=(stride_v_n, stride_v_d),
+                    offsets=(global_off, 0),
+                    block_shape=(KV_BS, D), order=(1, 0),
                 )
-                v = tl.load(p_v, boundary_check=(0,))
+                v = tl.load(p_v, boundary_check=(0, 1))
                 o_acc = o_acc + tl.dot(p.to(v.dtype), v)
 
                 pool_pos = tl.where(block_idx < HALF_POOL, block_idx,
@@ -338,7 +356,7 @@ def flash_scoring_kernel(
         else:
             ENTRIES_PER_KV: tl.constexpr = KV_BS // SCORE_BS
             EFFECTIVE_KV_LEN: tl.constexpr = ENTRIES_PER_KV * SCORE_BS_ORIG
-            num_kv_iters: tl.constexpr = (N + EFFECTIVE_KV_LEN - 1) // EFFECTIVE_KV_LEN
+            num_kv_iters: tl.constexpr = (N_PADDED + EFFECTIVE_KV_LEN - 1) // EFFECTIVE_KV_LEN
 
             k_base = K + i_b * stride_k_b + i_h * stride_k_h
             v_base = V + i_b * stride_v_b + i_h * stride_v_h
@@ -350,17 +368,24 @@ def flash_scoring_kernel(
 
             for i_kv in range(num_kv_iters):
                 kv_base = i_kv * EFFECTIVE_KV_LEN
-                j_in = kv_base + entry_id * SCORE_BS_ORIG + pos_in_entry
+                j_in = kv_base + entry_id * SCORE_BS_ORIG + pos_in_entry - PAD_HEAD
 
                 d_idx = tl.arange(0, D)[:, None]
+                if PAD_HEAD > 0 or PAD_TAIL > 0:
+                    load_mask = valid_load[None, :] & (j_in[None, :] >= 0) & (j_in[None, :] < N)
+                else:
+                    load_mask = valid_load[None, :] & (j_in[None, :] < N)
                 k = tl.load(
                     k_base + d_idx * stride_k_d + j_in[None, :] * stride_k_n,
-                    mask=valid_load[None, :] & (j_in[None, :] < N),
+                    mask=load_mask,
                     other=0.0
                 )
 
                 s = tl.dot(q, k)
-                s = tl.where(valid_load[None, :] & (j_in[None, :] < N), s, NEG_INF)
+                if PAD_HEAD > 0 or PAD_TAIL > 0:
+                    s = tl.where(load_mask, s, NEG_INF)
+                else:
+                    s = tl.where(valid_load[None, :] & (j_in[None, :] < N), s, NEG_INF)
 
                 m_local = tl.max(s, axis=1)
                 m_prev = m_global
@@ -376,9 +401,13 @@ def flash_scoring_kernel(
                 l_global = l_global + l_local
 
                 d_idx_v = tl.arange(0, D)
+                if PAD_HEAD > 0 or PAD_TAIL > 0:
+                    v_mask = valid_load[:, None] & (j_in[:, None] >= 0) & (j_in[:, None] < N)
+                else:
+                    v_mask = valid_load[:, None] & (j_in[:, None] < N)
                 v = tl.load(
                     v_base + j_in[:, None] * stride_v_n + d_idx_v[None, :] * stride_v_d,
-                    mask=valid_load[:, None] & (j_in[:, None] < N),
+                    mask=v_mask,
                     other=0.0
                 )
                 o_acc = o_acc + tl.dot(p.to(v.dtype), v)
@@ -648,7 +677,7 @@ def flash_scoring_dkv_kernel(
 class FlashScoringFunction(torch.autograd.Function):
     
     @staticmethod
-    def forward(ctx, q, k, v, num_heads, score_block_size, topk):
+    def forward(ctx, q, k, v, num_heads, score_block_size, topk, padding: Tuple[int, int]):
         B, N, C = q.shape
         H = num_heads
         D = C // H
@@ -658,15 +687,25 @@ class FlashScoringFunction(torch.autograd.Function):
         assert C % H == 0
         assert score_block_size >= 1
 
+        pad_head, pad_tail = padding
+        if pad_head < 0 or pad_tail < 0:
+            raise ValueError("padding must be non-negative (pad_head, pad_tail)")
+        n_padded = pad_head + N + pad_tail
+
         SCORE_K = _next_power_of_2(topk)
         SCORE_BS_ORIG = score_block_size
         SCORE_BS = _next_power_of_2(SCORE_BS_ORIG)
         IS_POW2 = (SCORE_BS_ORIG & (SCORE_BS_ORIG - 1)) == 0
 
-        if N % SCORE_BS_ORIG != 0:
-            raise ValueError(f"score_block_size ({SCORE_BS_ORIG}) must divide N ({N})")
-        if topk > N // SCORE_BS_ORIG:
-            raise ValueError(f"topk ({topk}) > num_blocks ({N // SCORE_BS_ORIG})")
+        if n_padded % SCORE_BS_ORIG != 0:
+            need = SCORE_BS_ORIG - (n_padded % SCORE_BS_ORIG)
+            raise ValueError(
+                f"pad_head + N + pad_tail = {n_padded} must be divisible by "
+                f"score_block_size ({SCORE_BS_ORIG}). Try padding=(0, {pad_tail + need})."
+            )
+        num_blocks = n_padded // SCORE_BS_ORIG
+        if topk > num_blocks:
+            raise ValueError(f"topk ({topk}) > num_blocks ({num_blocks})")
 
         max_valid_kv_bs = min(SCORE_BS * MAX_ALLOWED_ENTRIES_PER_KV, MAX_KV_BS_IN_CONFIGS)
         max_entries_per_kv = max_valid_kv_bs // SCORE_BS
@@ -688,6 +727,7 @@ class FlashScoringFunction(torch.autograd.Function):
             B=B, N=N, H=H, D=D,
             IS_POW2=IS_POW2, SCORE_BS=SCORE_BS, SCORE_BS_ORIG=SCORE_BS_ORIG,
             SCORE_K=SCORE_K, SCORE_POOL=SCORE_POOL,
+            PAD_HEAD=pad_head, PAD_TAIL=pad_tail, N_PADDED=n_padded,
             stride_q_b=q_4d.stride(0), stride_q_n=q_4d.stride(1),
             stride_q_h=q_4d.stride(2), stride_q_d=q_4d.stride(3),
             stride_k_b=k_4d.stride(0), stride_k_n=k_4d.stride(1),
@@ -703,9 +743,12 @@ class FlashScoringFunction(torch.autograd.Function):
             stride_tks_n=Pool_Scores.stride(2), stride_tks_k=Pool_Scores.stride(3),
         )
 
-        effective_k = min(topk, N // SCORE_BS_ORIG)
+        effective_k = min(topk, num_blocks)
         TopK_Scores = Pool_Scores[..., :effective_k]
         TopK_Indices = Pool_Indices[..., :effective_k]
+        TopK_Scores = _topk_scores_avg_normalize(
+            TopK_Scores, TopK_Indices, pad_head, pad_tail, n_padded, SCORE_BS_ORIG, N,
+        )
 
         ctx.save_for_backward(q_4d, k_4d, v_4d, O, LSE)
         ctx.num_heads = H
@@ -761,71 +804,123 @@ class FlashScoringFunction(torch.autograd.Function):
             N=N, H=H, D=D,
         )
 
-        return DQ.reshape(B, N, C), DK.reshape(B, N, C), DV.reshape(B, N, C), None, None, None
+        return DQ.reshape(B, N, C), DK.reshape(B, N, C), DV.reshape(B, N, C), None, None, None, None
 
 
 def flash_topk_score(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    num_heads: int,
+    num_heads: Optional[int] = None,
     score_block_size: int = 64,
     topk: int = 16,
+    padding: Tuple[int, int] = (0, 0),
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Flash Attention with TopK block scoring (Triton kernel).
 
     Args:
-        q: Query tensor [B, N, C] where C = num_heads * D.
-        k: Key tensor [B, N, C].
-        v: Value tensor [B, N, C].
-        num_heads: Number of attention heads.
+        q: Query [B, N, C] or [B, H, N, D] with C = num_heads * D.
+        k, v: Same layout as q.
+        num_heads: Required for 3D input; optional for 4D (inferred from shape[1]).
         score_block_size: Scoring block size (any positive integer).
             Internally padded to next power of 2 for kernel efficiency.
         topk: Number of top blocks to select (must be power of 2).
+        padding: Virtual padding ``(pad_head, pad_tail)`` so that
+            ``pad_head + N + pad_tail`` divides ``score_block_size``; QKV data unchanged.
 
     Returns:
-        o: Attention output [B, N, C].
+        o: Attention output, same rank as q ([B, N, C] or [B, H, N, D]).
         topk_indices: TopK block indices [B, H, N, topk].
         topk_scores: TopK block scores [B, H, N, topk].
     """
-    return FlashScoringFunction.apply(q, k, v, num_heads, score_block_size, topk)
+    input_4d = q.ndim == 4
+    if input_4d:
+        B, H, N, D = q.shape
+        if num_heads is not None and num_heads != H:
+            raise ValueError(f"num_heads ({num_heads}) != q.shape[1] ({H})")
+        num_heads = H
+        C = H * D
+        if k.shape != (B, H, N, D) or v.shape != (B, H, N, D):
+            raise ValueError("q, k, v must all be [B, H, N, D] for 4D input")
+        q = q.transpose(1, 2).reshape(B, N, C).contiguous()
+        k = k.transpose(1, 2).reshape(B, N, C).contiguous()
+        v = v.transpose(1, 2).reshape(B, N, C).contiguous()
+    else:
+        if q.ndim != 3:
+            raise ValueError("q must be 3D [B, N, C] or 4D [B, H, N, D]")
+        if num_heads is None:
+            raise ValueError("num_heads is required for 3D [B, N, C] input")
+
+    o, topk_indices, topk_scores = FlashScoringFunction.apply(
+        q, k, v, num_heads, score_block_size, topk, padding
+    )
+    if input_4d:
+        B, N, C = o.shape
+        H = num_heads
+        D = C // H
+        o = o.view(B, N, H, D).transpose(1, 2).contiguous()
+    return o, topk_indices, topk_scores
 
 
 def _flash_topk_score_naive(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    num_heads: int,
+    num_heads: Optional[int],
     block_size: int,
     topk: int,
     scale: Optional[float] = None,
+    padding: Tuple[int, int] = (0, 0),
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Flash Attention with TopK block scoring (naive reference implementation).
 
     Args:
-        q: Query tensor [B, N, C] where C = num_heads * D.
-        k: Key tensor [B, N, C].
-        v: Value tensor [B, N, C].
-        num_heads: Number of attention heads.
-        block_size: Number of tokens per KV block, must divide N evenly.
+        q: Query [B, N, C] or [B, H, N, D].
+        k, v: Same layout as q.
+        num_heads: Required for 3D input; optional for 4D (inferred from shape[1]).
+        block_size: Tokens per score block (``score_block_size``).
         topk: Number of top blocks to select.
         scale: Attention scale factor, defaults to 1/sqrt(D).
+        padding: ``(pad_head, pad_tail)`` for virtual padding (same as ``flash_topk_score``).
 
     Returns:
-        o: Attention output [B, H, N, D].
+        o: Attention output [B, H, N, D] (same layout as input if 4D).
         topk_indices: TopK block indices [B, H, N, topk].
         topk_scores: TopK block scores [B, H, N, topk].
     """
     dtype = q.dtype
-    B, N, C = q.shape
+    input_4d = q.ndim == 4
+    if input_4d:
+        B, H, N, D = q.shape
+        if num_heads is not None and num_heads != H:
+            raise ValueError(f"num_heads ({num_heads}) != q.shape[1] ({H})")
+        num_heads = H
+        C = H * D
+        if k.shape != (B, H, N, D) or v.shape != (B, H, N, D):
+            raise ValueError("q, k, v must all be [B, H, N, D] for 4D input")
+        q = q.transpose(1, 2).reshape(B, N, C)
+        k = k.transpose(1, 2).reshape(B, N, C)
+        v = v.transpose(1, 2).reshape(B, N, C)
+    else:
+        B, N, C = q.shape
+        if num_heads is None:
+            raise ValueError("num_heads is required for 3D [B, N, C] input")
+
     H = num_heads
     D = C // H
-    M = N // block_size
+    pad_head, pad_tail = padding
+    if pad_head < 0 or pad_tail < 0:
+        raise ValueError("padding must be non-negative (pad_head, pad_tail)")
+    n_padded = pad_head + N + pad_tail
 
     assert k.shape == (B, N, C), f"k shape {k.shape} != {(B, N, C)}"
     assert v.shape == (B, N, C), f"v shape {v.shape} != {(B, N, C)}"
     assert C % H == 0, f"C={C} not divisible by num_heads={H}"
-    assert N % block_size == 0, f"N={N} not divisible by block_size={block_size}"
+    if n_padded % block_size != 0:
+        raise ValueError(
+            f"pad_head + N + pad_tail = {n_padded} must be divisible by block_size ({block_size})"
+        )
+    M = n_padded // block_size
     assert topk <= M, f"topk={topk} must be <= M={M}"
 
     if scale is None:
@@ -841,11 +936,24 @@ def _flash_topk_score_naive(
     attn_weights = scores.softmax(dim=-1)
     o = torch.einsum('bhqk,bhkd->bhqd', attn_weights, v)
 
-    attn_blocks = rearrange(attn_weights, 'b h q (m bs) -> b h q m bs', bs=block_size)
-    block_scores = attn_blocks.sum(dim=-1)
+    if pad_head == 0 and pad_tail == 0:
+        attn_blocks = rearrange(attn_weights, 'b h q (m bs) -> b h q m bs', bs=block_size)
+        block_scores = attn_blocks.sum(dim=-1)
+    else:
+        block_scores = torch.zeros(B, H, N, M, device=q.device, dtype=q.dtype)
+        for m in range(M):
+            start = max(0, m * block_size - pad_head)
+            end = min(N, (m + 1) * block_size - pad_head)
+            if start < end:
+                block_scores[..., m] = attn_weights[..., start:end].sum(dim=-1)
 
     topk_scores, topk_indices = torch.topk(
-        block_scores, k=topk, dim=-1, largest=True, sorted=True
+        block_scores, k=min(topk, M), dim=-1, largest=True, sorted=True
+    )
+    topk_scores = _topk_scores_avg_normalize(
+        topk_scores, topk_indices, pad_head, pad_tail, n_padded, block_size, N,
     )
 
+    if input_4d:
+        o = o.transpose(1, 2).contiguous()
     return o.to(dtype), topk_indices, topk_scores
