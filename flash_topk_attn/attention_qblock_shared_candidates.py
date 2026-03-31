@@ -15,7 +15,7 @@ from einops import rearrange
 from flash_topk_attn.scoring import _next_power_of_2
 
 
-def build_qblock_merged_indices(topk_indices: torch.Tensor, Q_BS: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def build_qblock_topk_indices(topk_indices: torch.Tensor, Q_BS: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build sorted unique block ids per q-block (exact union).
 
     Args:
@@ -333,7 +333,7 @@ def flash_topk_attn_qblock_shared_candidates(
     if scale is None:
         scale = 1.0 / math.sqrt(D)
 
-    merged_indices, qblock_cu_seqlens = build_qblock_merged_indices(
+    merged_indices, qblock_cu_seqlens = build_qblock_topk_indices(
         topk_indices.contiguous(), Q_BS
     )
 
@@ -431,3 +431,5 @@ def _flash_topk_attn_qblock_shared_naive(
 
     o = rearrange(o, "b h n d -> b n (h d)")
     return o.to(dtype), lse_out
+
+
