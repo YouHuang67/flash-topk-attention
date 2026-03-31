@@ -73,32 +73,6 @@ MAX_KV_BS_IN_CONFIGS = 128
 MAX_ALLOWED_ENTRIES_PER_KV = 16
 
 
-def _topk_scores_avg_normalize(
-    topk_scores: torch.Tensor,
-    topk_indices: torch.Tensor,
-    pad_head: int,
-    pad_tail: int,
-    n_padded: int,
-    score_bs_orig: int,
-    n: int,
-) -> torch.Tensor:
-    """Scale block mass scores to be comparable across full vs partial blocks (virtual padding)."""
-    if pad_head == 0 and pad_tail == 0:
-        return topk_scores
-    num_blocks = n_padded // score_bs_orig
-    if num_blocks == 1:
-        return topk_scores * (float(score_bs_orig) / float(n))
-    c_first = float(score_bs_orig - pad_head)
-    c_last = float(score_bs_orig - pad_tail)
-    c_mid = float(score_bs_orig)
-    count = torch.where(
-        topk_indices == 0,
-        c_first,
-        torch.where(topk_indices == num_blocks - 1, c_last, c_mid),
-    )
-    return topk_scores * (float(score_bs_orig) / count)
-
-
 @triton.autotune(
     configs=[
         triton.Config({'Q_BS': q, 'KV_BS': kv}, num_warps=4 if q < 64 else 8)
@@ -154,6 +128,10 @@ def flash_scoring_kernel(
 
     if IS_POW2:
         num_kv_blocks: tl.constexpr = (N_PADDED + KV_BS - 1) // KV_BS
+        num_score_blocks: tl.constexpr = N_PADDED // SCORE_BS
+        inv_count_first = 1.0 / float(SCORE_BS - PAD_HEAD)
+        inv_count_last = 1.0 / float(SCORE_BS - PAD_TAIL)
+        inv_count_mid = 1.0 / float(SCORE_BS)
 
         p_k = tl.make_block_ptr(
             base=K + i_b * stride_k_b + i_h * stride_k_h,
@@ -208,6 +186,13 @@ def flash_scoring_kernel(
 
                     mask_entry = tl.arange(0, ENTRIES_PER_KV) == j
                     l_j = tl.sum(tl.where(mask_entry[None, :], l_sub, 0.0), axis=1)
+                    if PAD_HEAD > 0 or PAD_TAIL > 0:
+                        inv_c = tl.where(
+                            cur_entry == 0,
+                            inv_count_first,
+                            tl.where(cur_entry == num_score_blocks - 1, inv_count_last, inv_count_mid),
+                        )
+                        l_j = l_j * inv_c
 
                     pool_scores = tl.where(mask_j[None, :], l_j[:, None], pool_scores)
                     pool_indices = tl.where(mask_j[None, :], cur_entry, pool_indices)
@@ -221,7 +206,15 @@ def flash_scoring_kernel(
             elif KV_BS == SCORE_BS:
                 pool_base = tl.where(i_block >= HALF_POOL, HALF_POOL + (i_block % HALF_POOL), i_block)
                 mask_pool_base = tl.arange(0, SCORE_POOL) == pool_base
-                pool_scores = tl.where(mask_pool_base[None, :], l_local[:, None], pool_scores)
+                l_block = l_local
+                if PAD_HEAD > 0 or PAD_TAIL > 0:
+                    inv_c = tl.where(
+                        i_block == 0,
+                        inv_count_first,
+                        tl.where(i_block == num_score_blocks - 1, inv_count_last, inv_count_mid),
+                    )
+                    l_block = l_block * inv_c
+                pool_scores = tl.where(mask_pool_base[None, :], l_block[:, None], pool_scores)
                 pool_indices = tl.where(mask_pool_base[None, :], i_block, pool_indices)
 
                 if ((i_block + 1) >= HALF_POOL) and ((i_block + 1) % HALF_POOL == 0):
@@ -239,8 +232,16 @@ def flash_scoring_kernel(
                 mask_pos = tl.arange(0, SCORE_POOL) == pool_pos
 
                 old_val = tl.where(sub_iter == 0, 0.0, pool_scores)
+                l_add = l_local
+                if PAD_HEAD > 0 or PAD_TAIL > 0:
+                    inv_c = tl.where(
+                        score_block_idx == 0,
+                        inv_count_first,
+                        tl.where(score_block_idx == num_score_blocks - 1, inv_count_last, inv_count_mid),
+                    )
+                    l_add = l_add * inv_c
                 pool_scores = tl.where(mask_pos[None, :],
-                                      old_val + l_local[:, None],
+                                      old_val + l_add[:, None],
                                       pool_scores)
 
                 pool_indices = tl.where(mask_pos[None, :] & (sub_iter == 0),
@@ -280,6 +281,9 @@ def flash_scoring_kernel(
             KV_ITERS_PER_BLOCK: tl.constexpr = (SCORE_BS_ORIG + KV_BS - 1) // KV_BS
             num_score_blocks: tl.constexpr = N_PADDED // SCORE_BS_ORIG
             num_kv_iters: tl.constexpr = num_score_blocks * KV_ITERS_PER_BLOCK
+            inv_count_first = 1.0 / float(SCORE_BS_ORIG - PAD_HEAD)
+            inv_count_last = 1.0 / float(SCORE_BS_ORIG - PAD_TAIL)
+            inv_count_mid = 1.0 / float(SCORE_BS_ORIG)
 
             k_base = K + i_b * stride_k_b + i_h * stride_k_h
             v_base = V + i_b * stride_v_b + i_h * stride_v_h
@@ -336,8 +340,16 @@ def flash_scoring_kernel(
                 mask_pos = tl.arange(0, SCORE_POOL) == pool_pos
 
                 old_val = tl.where(sub_iter == 0, 0.0, pool_scores)
+                l_add = l_local
+                if PAD_HEAD > 0 or PAD_TAIL > 0:
+                    inv_c = tl.where(
+                        block_idx == 0,
+                        inv_count_first,
+                        tl.where(block_idx == num_score_blocks - 1, inv_count_last, inv_count_mid),
+                    )
+                    l_add = l_add * inv_c
                 pool_scores = tl.where(mask_pos[None, :],
-                                      old_val + l_local[:, None], pool_scores)
+                                      old_val + l_add[:, None], pool_scores)
                 pool_indices = tl.where(mask_pos[None, :] & (sub_iter == 0),
                                        block_idx, pool_indices)
 
@@ -357,6 +369,10 @@ def flash_scoring_kernel(
             ENTRIES_PER_KV: tl.constexpr = KV_BS // SCORE_BS
             EFFECTIVE_KV_LEN: tl.constexpr = ENTRIES_PER_KV * SCORE_BS_ORIG
             num_kv_iters: tl.constexpr = (N_PADDED + EFFECTIVE_KV_LEN - 1) // EFFECTIVE_KV_LEN
+            num_score_blocks: tl.constexpr = N_PADDED // SCORE_BS_ORIG
+            inv_count_first = 1.0 / float(SCORE_BS_ORIG - PAD_HEAD)
+            inv_count_last = 1.0 / float(SCORE_BS_ORIG - PAD_TAIL)
+            inv_count_mid = 1.0 / float(SCORE_BS_ORIG)
 
             k_base = K + i_b * stride_k_b + i_h * stride_k_h
             v_base = V + i_b * stride_v_b + i_h * stride_v_h
@@ -423,6 +439,13 @@ def flash_scoring_kernel(
 
                     mask_entry = tl.arange(0, ENTRIES_PER_KV) == j
                     l_j = tl.sum(tl.where(mask_entry[None, :], l_sub, 0.0), axis=1)
+                    if PAD_HEAD > 0 or PAD_TAIL > 0:
+                        inv_c = tl.where(
+                            cur_entry == 0,
+                            inv_count_first,
+                            tl.where(cur_entry == num_score_blocks - 1, inv_count_last, inv_count_mid),
+                        )
+                        l_j = l_j * inv_c
 
                     pool_scores = tl.where(mask_j[None, :], l_j[:, None], pool_scores)
                     pool_indices = tl.where(mask_j[None, :], cur_entry, pool_indices)
@@ -687,15 +710,19 @@ class FlashScoringFunction(torch.autograd.Function):
         assert C % H == 0
         assert score_block_size >= 1
 
-        pad_head, pad_tail = padding
-        if pad_head < 0 or pad_tail < 0:
-            raise ValueError("padding must be non-negative (pad_head, pad_tail)")
-        n_padded = pad_head + N + pad_tail
-
         SCORE_K = _next_power_of_2(topk)
         SCORE_BS_ORIG = score_block_size
         SCORE_BS = _next_power_of_2(SCORE_BS_ORIG)
         IS_POW2 = (SCORE_BS_ORIG & (SCORE_BS_ORIG - 1)) == 0
+
+        pad_head, pad_tail = padding
+        if pad_head < 0 or pad_tail < 0:
+            raise ValueError("padding must be non-negative (pad_head, pad_tail)")
+        if pad_head >= SCORE_BS_ORIG or pad_tail >= SCORE_BS_ORIG:
+            raise ValueError(
+                f"padding ({pad_head}, {pad_tail}) must each be < score_block_size ({SCORE_BS_ORIG})"
+            )
+        n_padded = pad_head + N + pad_tail
 
         if n_padded % SCORE_BS_ORIG != 0:
             need = SCORE_BS_ORIG - (n_padded % SCORE_BS_ORIG)
@@ -746,9 +773,6 @@ class FlashScoringFunction(torch.autograd.Function):
         effective_k = min(topk, num_blocks)
         TopK_Scores = Pool_Scores[..., :effective_k]
         TopK_Indices = Pool_Indices[..., :effective_k]
-        TopK_Scores = _topk_scores_avg_normalize(
-            TopK_Scores, TopK_Indices, pad_head, pad_tail, n_padded, SCORE_BS_ORIG, N,
-        )
 
         ctx.save_for_backward(q_4d, k_4d, v_4d, O, LSE)
         ctx.num_heads = H
@@ -911,6 +935,10 @@ def _flash_topk_score_naive(
     pad_head, pad_tail = padding
     if pad_head < 0 or pad_tail < 0:
         raise ValueError("padding must be non-negative (pad_head, pad_tail)")
+    if pad_head >= block_size or pad_tail >= block_size:
+        raise ValueError(
+            f"padding ({pad_head}, {pad_tail}) must each be < block_size ({block_size})"
+        )
     n_padded = pad_head + N + pad_tail
 
     assert k.shape == (B, N, C), f"k shape {k.shape} != {(B, N, C)}"
@@ -945,15 +973,12 @@ def _flash_topk_score_naive(
             start = max(0, m * block_size - pad_head)
             end = min(N, (m + 1) * block_size - pad_head)
             if start < end:
-                block_scores[..., m] = attn_weights[..., start:end].sum(dim=-1)
+                count = end - start
+                block_scores[..., m] = attn_weights[..., start:end].sum(dim=-1) / float(count)
 
     topk_scores, topk_indices = torch.topk(
         block_scores, k=min(topk, M), dim=-1, largest=True, sorted=True
     )
-    topk_scores = _topk_scores_avg_normalize(
-        topk_scores, topk_indices, pad_head, pad_tail, n_padded, block_size, N,
-    )
-
     if input_4d:
         o = o.transpose(1, 2).contiguous()
     return o.to(dtype), topk_indices, topk_scores
