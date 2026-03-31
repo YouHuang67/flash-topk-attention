@@ -77,46 +77,96 @@ import torch
 from flash_topk_attn import flash_topk_score
 
 B, N, H, D = 2, 1024, 8, 64
-C = H * D
-q = torch.randn(B, N, C, device="cuda", dtype=torch.float16)
-k = torch.randn(B, N, C, device="cuda", dtype=torch.float16)
-v = torch.randn(B, N, C, device="cuda", dtype=torch.float16)
+
+# 3D input: [B, N, C] where C = H * D — num_heads required
+q = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
+k = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
+v = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
 
 o, topk_indices, topk_scores = flash_topk_score(
-    q, k, v,
-    num_heads=H,
-    score_block_size=64,  # b: tokens per KV block, must divide N evenly
-    topk=16,              # k: top blocks per query, must satisfy k <= N // b
-)
-# o:             [B, N, C]       full attention output
-# topk_indices:  [B, H, N, 16]   int32, descending by score
-# topk_scores:   [B, H, N, 16]   float32, normalized block attention weights
-# Supported dtypes: float16, bfloat16, float32
-```
-
-### Sparse Attention
-
-```python
-from flash_topk_attn import flash_topk_score, flash_topk_attn
-
-# Step 1: Scoring — get top-k block indices per query
-o_full, topk_indices, topk_scores = flash_topk_score(
     q, k, v,
     num_heads=H,
     score_block_size=64,
     topk=16,
 )
+# o:             [B, N, C]        attention output
+# topk_indices:  [B, H, N, topk]  int32 block ids
+# topk_scores:   [B, H, N, topk]  float32 block scores
 
-# Step 2: Sparse Attention — attend only to selected blocks
+# 4D input: [B, H, N, D] — num_heads inferred from shape
+q4 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+k4 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+v4 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+
+o4, topk_indices, topk_scores = flash_topk_score(
+    q4, k4, v4,
+    score_block_size=64,
+    topk=16,
+)
+# o4: [B, H, N, D] — output matches input layout
+```
+
+**Virtual padding** — when `N` is not divisible by `score_block_size`:
+
+```python
+# N=1000 is not divisible by 64, pad to 1024
+o, topk_indices, topk_scores = flash_topk_score(
+    q, k, v,
+    num_heads=H,
+    score_block_size=64,
+    topk=16,
+    padding=(0, 24),  # pad_head + N + pad_tail must divide score_block_size
+)
+# QKV data unchanged; padding is purely logical
+```
+
+### Sparse Attention
+
+```python
+from flash_topk_attn import flash_topk_score, flash_topk_attn, build_qblock_topk_indices
+
+# Step 1: Score — get per-query top-k block indices
+o_full, topk_indices, topk_scores = flash_topk_score(
+    q, k, v, num_heads=H, score_block_size=64, topk=16,
+)
+# topk_indices: [B, H, N, topk]
+
+# Step 2: Build — group per-query indices into per-q-block candidate sets
+merged_indices, cu_seqlens = build_qblock_topk_indices(
+    topk_indices,       # [B, H, N, topk]
+    q_block_size=32,
+)
+# merged_indices: [B, H, S]      sorted unique block ids, -1 padded
+# cu_seqlens:     [B, H, QM+1]   cumulative lengths per q-block
+
+# Step 3: Attend — sparse attention over candidate blocks
 o_sparse, lse = flash_topk_attn(
     q, k, v,
-    topk_indices,
+    merged_indices, cu_seqlens,
     num_heads=H,
-    q_block_size=32,   # queries per shared-candidate group
-    kv_block_size=64,  # must match score_block_size
+    q_block_size=32,
+    kv_block_size=64,   # must match score_block_size
 )
-# o_sparse:  [B, N, C]   sparse attention output
-# lse:       [B, H, N]   log-sum-exp (float32)
+# o_sparse: [B, N, C]    sparse attention output
+# lse:      [B, H, N]    log-sum-exp (float32)
+```
+
+Steps 2 and 3 are decoupled — `merged_indices` can be reused across multiple attention calls (e.g. different layers sharing the same sparsity pattern).
+
+**Virtual padding** for sparse attention (independent Q and KV padding):
+
+```python
+q_padding  = (8, 24)   # q_pad_head + N + q_pad_tail must divide q_block_size
+kv_padding = (0, 24)   # kv_pad_head + N + kv_pad_tail must divide kv_block_size
+
+merged_indices, cu_seqlens = build_qblock_topk_indices(
+    topk_indices, q_block_size=32, q_padding=q_padding,
+)
+o_sparse, lse = flash_topk_attn(
+    q, k, v, merged_indices, cu_seqlens,
+    num_heads=H, q_block_size=32, kv_block_size=64,
+    q_padding=q_padding, kv_padding=kv_padding,
+)
 ```
 
 ## Todo

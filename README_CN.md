@@ -77,46 +77,96 @@ import torch
 from flash_topk_attn import flash_topk_score
 
 B, N, H, D = 2, 1024, 8, 64
-C = H * D
-q = torch.randn(B, N, C, device="cuda", dtype=torch.float16)
-k = torch.randn(B, N, C, device="cuda", dtype=torch.float16)
-v = torch.randn(B, N, C, device="cuda", dtype=torch.float16)
+
+# 3D 输入: [B, N, C]，C = H * D — 必须指定 num_heads
+q = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
+k = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
+v = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
 
 o, topk_indices, topk_scores = flash_topk_score(
-    q, k, v,
-    num_heads=H,
-    score_block_size=64,  # b: 每个 KV block 的 token 数，必须整除 N
-    topk=16,              # k: 每个 query 选取的 top block 数，须满足 k <= N // b
-)
-# o:             [B, N, C]       完整注意力输出
-# topk_indices:  [B, H, N, 16]   int32，按分数降序排列
-# topk_scores:   [B, H, N, 16]   float32，归一化的 block 注意力权重
-# 支持数据类型：float16, bfloat16, float32
-```
-
-### 稀疏注意力
-
-```python
-from flash_topk_attn import flash_topk_score, flash_topk_attn
-
-# 第一步：打分 — 获取每个 query 的 top-k block 索引
-o_full, topk_indices, topk_scores = flash_topk_score(
     q, k, v,
     num_heads=H,
     score_block_size=64,
     topk=16,
 )
+# o:             [B, N, C]        注意力输出
+# topk_indices:  [B, H, N, topk]  int32 block 索引
+# topk_scores:   [B, H, N, topk]  float32 block 分数
 
-# 第二步：稀疏注意力 — 仅对选中的 block 计算注意力
+# 4D 输入: [B, H, N, D] — 自动推断 num_heads
+q4 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+k4 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+v4 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+
+o4, topk_indices, topk_scores = flash_topk_score(
+    q4, k4, v4,
+    score_block_size=64,
+    topk=16,
+)
+# o4: [B, H, N, D] — 输出与输入 layout 一致
+```
+
+**虚拟 padding** — 当 `N` 不能整除 `score_block_size` 时：
+
+```python
+# N=1000 不能整除 64，pad 到 1024
+o, topk_indices, topk_scores = flash_topk_score(
+    q, k, v,
+    num_heads=H,
+    score_block_size=64,
+    topk=16,
+    padding=(0, 24),  # pad_head + N + pad_tail 须整除 score_block_size
+)
+# QKV 数据不变；padding 纯逻辑概念
+```
+
+### 稀疏注意力
+
+```python
+from flash_topk_attn import flash_topk_score, flash_topk_attn, build_qblock_topk_indices
+
+# 第 1 步：打分 — 获取每个 query 的 top-k block 索引
+o_full, topk_indices, topk_scores = flash_topk_score(
+    q, k, v, num_heads=H, score_block_size=64, topk=16,
+)
+# topk_indices: [B, H, N, topk]
+
+# 第 2 步：构建 — 按 q-block 聚合 per-query 索引为共享候选集
+merged_indices, cu_seqlens = build_qblock_topk_indices(
+    topk_indices,       # [B, H, N, topk]
+    q_block_size=32,
+)
+# merged_indices: [B, H, S]      排序去重的 block id，-1 填充
+# cu_seqlens:     [B, H, QM+1]   每个 q-block 的累积长度
+
+# 第 3 步：注意力 — 仅对候选 block 计算稀疏注意力
 o_sparse, lse = flash_topk_attn(
     q, k, v,
-    topk_indices,
+    merged_indices, cu_seqlens,
     num_heads=H,
-    q_block_size=32,   # 共享候选的 query 分组大小
-    kv_block_size=64,  # 须与 score_block_size 一致
+    q_block_size=32,
+    kv_block_size=64,   # 须与 score_block_size 一致
 )
-# o_sparse:  [B, N, C]   稀疏注意力输出
-# lse:       [B, H, N]   log-sum-exp (float32)
+# o_sparse: [B, N, C]    稀疏注意力输出
+# lse:      [B, H, N]    log-sum-exp (float32)
+```
+
+第 2、3 步解耦 — `merged_indices` 可跨多次注意力调用复用（如多层共享相同稀疏模式）。
+
+**虚拟 padding**（Q 和 KV 独立 padding）：
+
+```python
+q_padding  = (8, 24)   # q_pad_head + N + q_pad_tail 须整除 q_block_size
+kv_padding = (0, 24)   # kv_pad_head + N + kv_pad_tail 须整除 kv_block_size
+
+merged_indices, cu_seqlens = build_qblock_topk_indices(
+    topk_indices, q_block_size=32, q_padding=q_padding,
+)
+o_sparse, lse = flash_topk_attn(
+    q, k, v, merged_indices, cu_seqlens,
+    num_heads=H, q_block_size=32, kv_block_size=64,
+    q_padding=q_padding, kv_padding=kv_padding,
+)
 ```
 
 ## Todo
