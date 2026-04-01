@@ -2,7 +2,7 @@
 
 # Flash TopK Attention
 
-融合 Flash Attention、$\text{top-}k$ KV block 打分与稀疏注意力的 Triton 内核。在计算注意力输出的同时对每个 query 的 KV block 按聚合注意力概率打分，返回 $\text{top-}k$ block 索引，用于下游稀疏注意力计算。
+融合 Flash Attention、top-k KV block 打分与稀疏注意力的 Triton 内核。在计算注意力输出的同时对每个 query 的 KV block 按聚合注意力概率打分，返回 top-k block 索引，用于下游稀疏注意力计算。
 
 ## 算法
 
@@ -36,6 +36,14 @@ $$O_t = \sum_{j \in \mathcal{C}_m} \frac{\exp(q_t k_j^\top / \sqrt{D})}{\sum_{j'
 
 - $g=1$：每个 query 仅访问自己的 top-k blocks（per-query 稀疏注意力）
 - $g>1$：query 共享候选，实现批量 KV 访问，但每个 query 的注意力范围略有扩大
+
+### 虚拟 Padding
+
+当 $N$ 不能整除 block 大小 $b$ 时，虚拟 padding 将序列扩展为 $N' = \text{pad\_head} + N + \text{pad\_tail}$，满足 $N' \equiv 0 \pmod{b}$。Padding 纯为逻辑概念，QKV 数据不变，padding 位置在 softmax 前被掩码为 $-\infty$。对于头尾的不完整 block，block 分数按有效 token 数归一化：
+
+$$s_j \leftarrow \frac{s_j}{|\{i \in \text{block}_j : i < N\}|}$$
+
+保证完整 block 与部分 block 之间 top-k 排序公平。`flash_topk_attn` 中 Q 侧与 KV 侧 padding 独立指定。
 
 ## 性能
 

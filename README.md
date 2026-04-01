@@ -37,6 +37,14 @@ $$O_t = \sum_{j \in \mathcal{C}_m} \frac{\exp(q_t k_j^\top / \sqrt{D})}{\sum_{j'
 - When $g=1$: each query attends only to its own top-k blocks (per-query sparse attention)
 - When $g>1$: queries share candidates, enabling batched KV access but slightly expanding each query's attention scope
 
+### Virtual Padding
+
+When $N$ is not divisible by the block size $b$, virtual padding extends the sequence to $N' = \text{pad\_head} + N + \text{pad\_tail}$ such that $N' \equiv 0 \pmod{b}$. The padding is purely logical: QKV data is unchanged, and padded positions are masked to $-\infty$ before softmax. For partial blocks at the head or tail, the block score is normalized by the number of valid tokens:
+
+$$s_j \leftarrow \frac{s_j}{|\{i \in \text{block}_j : i < N\}|}$$
+
+This ensures fair top-k ranking across full and partial blocks. Q-side and KV-side padding are specified independently in `flash_topk_attn`.
+
 ## Performance
 
 Baselines: **Naive** = standard attention + `torch.topk` (two separate passes); **FA2** = Flash Attention 2 forward only, no TopK scoring (lower bound).
