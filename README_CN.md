@@ -39,11 +39,7 @@ $$O_t = \sum_{j \in \mathcal{C}_m} \frac{\exp(q_t k_j^\top / \sqrt{D})}{\sum_{j'
 
 ### 虚拟 Padding
 
-当 $N$ 不能整除 block 大小 $b$ 时，虚拟 padding 将序列扩展为 $N' = \text{pad\_head} + N + \text{pad\_tail}$，满足 $N' \equiv 0 \pmod{b}$。Padding 纯为逻辑概念，QKV 数据不变，padding 位置在 softmax 前被掩码为 $-\infty$。对于头尾的不完整 block，block 分数按有效 token 数归一化：
-
-$$s_j \leftarrow \frac{s_j}{|\{i \in \text{block}_j : i < N\}|}$$
-
-保证完整 block 与部分 block 之间 top-k 排序公平。`flash_topk_attn` 中 Q 侧与 KV 侧 padding 独立指定。
+当 N 不能整除 block 大小 b 时，虚拟 padding 将序列扩展为 N' = pad_head + N + pad_tail，使 N' 能被 b 整除。Padding 纯为逻辑概念，QKV 数据不变，padding 位置在 softmax 前被掩码为负无穷。对于头尾的不完整 block，block 分数按有效 token 数归一化，保证完整 block 与部分 block 之间 top-k 排序公平。`flash_topk_attn` 中 Q 侧与 KV 侧 padding 独立指定。
 
 ## 性能
 

@@ -39,11 +39,7 @@ $$O_t = \sum_{j \in \mathcal{C}_m} \frac{\exp(q_t k_j^\top / \sqrt{D})}{\sum_{j'
 
 ### Virtual Padding
 
-When $N$ is not divisible by the block size $b$, virtual padding extends the sequence to $N' = \text{pad\_head} + N + \text{pad\_tail}$ such that $N' \equiv 0 \pmod{b}$. The padding is purely logical: QKV data is unchanged, and padded positions are masked to $-\infty$ before softmax. For partial blocks at the head or tail, the block score is normalized by the number of valid tokens:
-
-$$s_j \leftarrow \frac{s_j}{|\{i \in \text{block}_j : i < N\}|}$$
-
-This ensures fair top-k ranking across full and partial blocks. Q-side and KV-side padding are specified independently in `flash_topk_attn`.
+When N is not divisible by block size b, virtual padding extends the sequence to N' = pad_head + N + pad_tail where N' is divisible by b. The padding is purely logical: QKV data is unchanged, and padded positions are masked to negative infinity before softmax. For partial blocks at the head or tail, the block score is normalized by the number of valid tokens, ensuring fair top-k ranking across full and partial blocks. Q-side and KV-side padding are specified independently in `flash_topk_attn`.
 
 ## Performance
 
