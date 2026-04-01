@@ -140,17 +140,18 @@ o_full, topk_indices, topk_scores = flash_topk_score(
 # topk_indices: [B, H, N, topk]
 
 # Step 2: Build, group per-query indices into per-q-block candidate sets
-merged_indices, cu_seqlens = build_qblock_topk_indices(
+merged_indices, counts, S_MAX = build_qblock_topk_indices(
     topk_indices,       # [B, H, N, topk]
     q_block_size=32,
 )
-# merged_indices: [B, H, S]      sorted unique block ids, -1 padded
-# cu_seqlens:     [B, H, QM+1]   cumulative lengths per q-block
+# merged_indices: [B, H, QM, S_MAX]  sorted unique block ids, -1 padded
+# counts:         [B, H, QM]         number of valid indices per q-block
+# S_MAX:          int                segment size
 
 # Step 3: Attend, sparse attention over candidate blocks
 o_sparse, lse = flash_topk_attn(
     q, k, v,
-    merged_indices, cu_seqlens,
+    merged_indices, counts,
     num_heads=H,
     q_block_size=32,
     kv_block_size=64,   # must match score_block_size
@@ -167,11 +168,11 @@ o_sparse, lse = flash_topk_attn(
 q_padding  = (8, 24)   # q_pad_head + N + q_pad_tail must divide q_block_size
 kv_padding = (0, 24)   # kv_pad_head + N + kv_pad_tail must divide kv_block_size
 
-merged_indices, cu_seqlens = build_qblock_topk_indices(
+merged_indices, counts, S_MAX = build_qblock_topk_indices(
     topk_indices, q_block_size=32, q_padding=q_padding,
 )
 o_sparse, lse = flash_topk_attn(
-    q, k, v, merged_indices, cu_seqlens,
+    q, k, v, merged_indices, counts,
     num_heads=H, q_block_size=32, kv_block_size=64,
     q_padding=q_padding, kv_padding=kv_padding,
 )

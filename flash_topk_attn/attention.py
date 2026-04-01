@@ -16,12 +16,66 @@ from einops import rearrange
 from flash_topk_attn.scoring import _next_power_of_2
 
 
+def _next_pow2(n: int) -> int:
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+@triton.jit
+def _build_qblock_indices_kernel(
+    topk_ptr, merged_ptr, counts_ptr,
+    stride_ti_bh, stride_ti_n, stride_ti_k,
+    stride_mi_bh, stride_ct_bh,
+    Q_BS: tl.constexpr, KQ: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr, S_MAX: tl.constexpr,
+):
+    """Per q-block load-sort-dedup kernel."""
+    i_qm = tl.program_id(0)
+    i_bh = tl.program_id(1)
+
+    ti_base = i_bh * stride_ti_bh + i_qm * Q_BS * stride_ti_n
+    offs = tl.arange(0, BLOCK_SIZE)
+    q_off = offs // KQ
+    k_off = offs % KQ
+    ids = tl.load(
+        topk_ptr + ti_base + q_off * stride_ti_n + k_off * stride_ti_k,
+        mask=q_off < Q_BS,
+        other=-1,
+    )
+
+    ids_sorted = tl.sort(ids)
+
+    mi_base = i_bh * stride_mi_bh + i_qm * S_MAX
+    tl.store(merged_ptr + mi_base + offs, ids_sorted, mask=offs < S_MAX)
+    tl.debug_barrier()
+
+    cur = tl.load(merged_ptr + mi_base + offs, mask=offs < S_MAX, other=-1)
+    prev = tl.load(merged_ptr + mi_base + offs - 1, mask=offs > 0, other=-2)
+    is_new = (cur >= 0) & ((offs == 0) | (cur != prev))
+
+    local_offset = tl.cumsum(is_new.to(tl.int32), axis=0)
+    count = tl.max(local_offset, axis=0)
+    local_offset = local_offset - 1
+
+    tl.store(
+        merged_ptr + mi_base + offs,
+        tl.full([BLOCK_SIZE], -1, tl.int32),
+        mask=offs < S_MAX,
+    )
+    tl.debug_barrier()
+    tl.store(merged_ptr + mi_base + local_offset, cur, mask=is_new)
+
+    tl.store(counts_ptr + i_bh * stride_ct_bh + i_qm, count)
+
+
 def build_qblock_topk_indices(
     topk_indices: torch.Tensor,
     q_block_size: int,
     q_padding: Tuple[int, int] = (0, 0),
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build sorted unique block ids per q-block (exact union).
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Build sorted unique block ids per q-block (exact union) using Triton.
 
     Args:
         topk_indices: [B, H, N, KQ] int32 (or int64); -1 marks empty slots.
@@ -30,56 +84,50 @@ def build_qblock_topk_indices(
             q_pad_head + N + q_pad_tail must be divisible by q_block_size.
 
     Returns:
-        merged_indices: [B, H, N * KQ] int32, valid prefix then -1 padding.
-        qblock_cu_seqlens: [B, H, QM + 1] int32 cumulative lengths per q-block.
+        merged_indices: [B, H, QM, S_MAX] int32, valid prefix then -1 padding.
+        counts: [B, H, QM] int32, number of valid indices per q-block.
+        S_MAX: int, segment size (next_pow2(q_block_size * KQ)).
     """
     B, H, N, KQ = topk_indices.shape
     q_pad_head, q_pad_tail = q_padding
+    device = topk_indices.device
 
-    if q_pad_head > 0 or q_pad_tail > 0:
-        # pad along sequence dimension: [B, H, N, KQ] -> [B, H, N_Q_PADDED, KQ]
-        topk_indices = F.pad(topk_indices, (0, 0, q_pad_head, q_pad_tail), value=-1)
-        N_Q_PADDED = q_pad_head + N + q_pad_tail
-    else:
-        N_Q_PADDED = N
-
+    N_Q_PADDED = q_pad_head + N + q_pad_tail
     assert (
         N_Q_PADDED % q_block_size == 0
     ), f"N_Q_PADDED={N_Q_PADDED} must be divisible by q_block_size={q_block_size}"
     QM = N_Q_PADDED // q_block_size
-    device = topk_indices.device
 
-    ids = topk_indices.to(torch.int32).view(B, H, QM, q_block_size * KQ)
-    ids_sorted, _ = torch.sort(ids, dim=-1, stable=True)
+    topk_flat = topk_indices.to(torch.int32).contiguous().view(B * H, N, KQ)
+    if q_pad_head > 0 or q_pad_tail > 0:
+        topk_flat = F.pad(topk_flat, (0, 0, q_pad_head, q_pad_tail), value=-1)
 
-    valid = ids_sorted >= 0
-    prev = torch.roll(ids_sorted, shifts=1, dims=-1)
-    prev[..., 0] = -2
-    is_new = valid & (ids_sorted != prev)
+    raw_size = q_block_size * KQ
+    BLOCK_SIZE = _next_pow2(raw_size)
+    S_MAX = BLOCK_SIZE
+    BH = B * H
 
-    qblock_lens = is_new.sum(dim=-1, dtype=torch.int32)
-    qblock_cu_seqlens = torch.zeros(B, H, QM + 1, device=device, dtype=torch.int32)
-    qblock_cu_seqlens[..., 1:] = torch.cumsum(qblock_lens, dim=-1)
+    merged = torch.full((BH, QM * S_MAX), -1, device=device, dtype=torch.int32)
+    counts = torch.empty((BH, QM), device=device, dtype=torch.int32)
 
-    local_offset = torch.cumsum(is_new.to(torch.int32), dim=-1) - 1
-    base = qblock_cu_seqlens[..., :-1, None]
-    global_idx = base + local_offset
+    _build_qblock_indices_kernel[(QM, BH)](
+        topk_flat,
+        merged,
+        counts,
+        topk_flat.stride(0),
+        topk_flat.stride(1),
+        topk_flat.stride(2),
+        merged.stride(0),
+        counts.stride(0),
+        Q_BS=q_block_size,
+        KQ=KQ,
+        BLOCK_SIZE=BLOCK_SIZE,
+        S_MAX=S_MAX,
+    )
 
-    max_sum = int(qblock_cu_seqlens[:, :, -1].max().item())
-    merged_indices = torch.full((B, H, max_sum), -1, device=device, dtype=torch.int32)
-
-    bh_offset = torch.arange(B * H, device=device, dtype=torch.int64).view(B, H, 1, 1)
-    global_idx_with_bh = bh_offset * max_sum + global_idx.to(torch.int64)
-    is_new_flat = is_new.reshape(-1)
-    ids_sorted_flat = ids_sorted.reshape(-1)
-    global_idx_flat = global_idx_with_bh.reshape(-1)
-
-    merged_flat = merged_indices.reshape(-1)
-    merged_flat[global_idx_flat[is_new_flat]] = ids_sorted_flat[is_new_flat]
-
-    merged_full = torch.full((B, H, N * KQ), -1, device=device, dtype=torch.int32)
-    merged_full[:, :, :max_sum] = merged_indices
-    return merged_full, qblock_cu_seqlens
+    merged_seg = merged.view(B, H, QM, S_MAX)
+    counts = counts.view(B, H, QM)
+    return merged_seg, counts, S_MAX
 
 
 @triton.jit
@@ -93,11 +141,9 @@ def _qblock_accum_kv(
 ):
     """One KV sub-step: load K/V, tl.dot scores, online softmax in log2 domain."""
     if BRANCH_ID == 1:
-        # KV_TILE >= KV_BS: semantic block (KV_BS) with physical tile KV_TILE (2^k).
         token_offset = kv_block * KV_BS - KV_PAD_HEAD
 
         if KV_PAD_HEAD > 0:
-            # Safe path: keep base, shape=(D, N), allow negative offsets guarded by boundary_check.
             p_k = tl.make_block_ptr(
                 base=k_base,
                 shape=(D, N),
@@ -120,7 +166,6 @@ def _qblock_accum_kv(
             kv_idx = tl.arange(0, KV_TILE)
             tile_valid = (kv_idx < KV_BS) & (token_offset + kv_idx >= 0) & (token_offset + kv_idx < N)
         else:
-            # Original fast path: absorb offset into base, logical shape caps to KV_BS.
             p_k = tl.make_block_ptr(
                 base=k_base + token_offset * stride_k_t,
                 shape=(D, KV_BS),
@@ -204,18 +249,19 @@ def _qblock_accum_kv(
 )
 @triton.jit
 def _flash_topk_attn_fwd_kernel(
-    q_ptr, k_ptr, v_ptr, merged_indices_ptr, qblock_cu_seqlens_ptr, o_ptr, lse_ptr,
+    q_ptr, k_ptr, v_ptr, merged_indices_ptr, counts_ptr, o_ptr, lse_ptr,
     stride_q_b, stride_q_t, stride_q_h, stride_q_d,
     stride_k_b, stride_k_t, stride_k_h, stride_k_d,
     stride_v_b, stride_v_t, stride_v_h, stride_v_d,
-    stride_mi_b, stride_mi_h, stride_mi_s,
-    stride_cu_b, stride_cu_h, stride_cu_q,
+    stride_mi_b, stride_mi_h, stride_mi_qm, stride_mi_s,
+    stride_ct_b, stride_ct_h, stride_ct_qm,
     stride_o_b, stride_o_t, stride_o_h, stride_o_d,
     stride_lse_b, stride_lse_h, stride_lse_t,
     B, H, H_BI, N, D, QM, scale,
     Q_BS: tl.constexpr, KV_BS: tl.constexpr, Q_TILE: tl.constexpr, KV_TILE: tl.constexpr,
     BD: tl.constexpr, BV: tl.constexpr,
     Q_PAD_HEAD: tl.constexpr, KV_PAD_HEAD: tl.constexpr,
+    S_MAX: tl.constexpr,
 ):
     NEG_INF_C: tl.constexpr = -1e38
 
@@ -265,7 +311,6 @@ def _flash_topk_attn_fwd_kernel(
         order=(1, 0),
     )
     if Q_PAD_HEAD > 0:
-        # With Q padding we may read outside [0, N); rely on boundary_check
         b_q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32) * scale_log2
     else:
         if Q_BS % Q_TILE == 0 and D % BD == 0:
@@ -288,14 +333,18 @@ def _flash_topk_attn_fwd_kernel(
     b_l = tl.zeros([Q_TILE], dtype=tl.float32)
     b_o = tl.zeros([Q_TILE, BV], dtype=tl.float32)
 
-    cu_ptr = qblock_cu_seqlens_ptr + i_b * stride_cu_b + i_h_bi * stride_cu_h
-    start = tl.load(cu_ptr + qm * stride_cu_q).to(tl.int32)
-    end = tl.load(cu_ptr + (qm + 1) * stride_cu_q).to(tl.int32)
-
-    mi_row = merged_indices_ptr + i_b * stride_mi_b + i_h_bi * stride_mi_h
-
-    for idx in range(start, end):
-        kv_block = tl.load(mi_row + idx * stride_mi_s).to(tl.int32)
+    count = tl.load(
+        counts_ptr + i_b * stride_ct_b + i_h_bi * stride_ct_h + qm * stride_ct_qm
+    ).to(tl.int32)
+    mi_base = (
+        merged_indices_ptr
+        + i_b * stride_mi_b
+        + i_h_bi * stride_mi_h
+        + qm * stride_mi_qm
+    )
+    max_count = tl.minimum(count, S_MAX)
+    for idx in range(max_count):
+        kv_block = tl.load(mi_base + idx * stride_mi_s).to(tl.int32)
 
         if BRANCH_ID == 1:
             b_m, b_l, b_o = _qblock_accum_kv(
@@ -366,7 +415,7 @@ def flash_topk_attn(
     k: torch.Tensor,
     v: torch.Tensor,
     merged_indices: torch.Tensor,
-    qblock_cu_seqlens: torch.Tensor,
+    counts: torch.Tensor,
     num_heads: int,
     q_block_size: int,
     kv_block_size: int,
@@ -374,15 +423,14 @@ def flash_topk_attn(
     num_kv_heads: Optional[int] = None,
     kv_padding: Tuple[int, int] = (0, 0),
     q_padding: Tuple[int, int] = (0, 0),
+    S_MAX: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Sparse attention with exact per-q-block union of top-k KV blocks.
 
     Args:
         q, k, v: [B, N, C], C = num_heads * D.
-        merged_indices: [B, H, S] int32, valid prefix then -1 padding; built by
-            :func:`build_qblock_topk_indices`.
-        qblock_cu_seqlens: [B, H, QM + 1] int32 cumulative lengths per q-block; built
-            by :func:`build_qblock_topk_indices`.
+        merged_indices: [B, H_BI, QM, S_MAX] int32, from build_qblock_topk_indices.
+        counts: [B, H_BI, QM] int32, number of valid indices per q-block.
         num_heads: H.
         q_block_size: queries per shared-candidate group.
         kv_block_size: tokens per block id; must match scoring.
@@ -390,7 +438,8 @@ def flash_topk_attn(
         num_kv_heads: v1 requires num_kv_heads == num_heads.
         kv_padding: (kv_pad_head, kv_pad_tail) virtual padding for KV alignment.
         q_padding: (q_pad_head, q_pad_tail) virtual padding for Q alignment; must
-            match the value used when building ``merged_indices``.
+            match the value used when building merged_indices.
+        S_MAX: optional; inferred from merged_indices.shape[-1] when omitted.
 
     Returns:
         o: [B, N, C], lse: [B, H, N] float32 (natural log).
@@ -427,8 +476,12 @@ def flash_topk_attn(
 
     QM = N_Q_PADDED // Q_BS
 
-    # H_BI is implicit in merged_indices/qblock_cu_seqlens shapes; enforce H_BI in {1, H}.
-    H_BI = merged_indices.shape[1]
+    merged_seg = merged_indices.to(torch.int32).contiguous()
+    counts = counts.to(torch.int32).contiguous()
+    H_BI = merged_seg.shape[1]
+    if S_MAX is None:
+        S_MAX = merged_seg.shape[-1]
+
     assert H_BI == 1 or H_BI == H
 
     if scale is None:
@@ -453,15 +506,15 @@ def flash_topk_attn(
         q_h,
         k_h,
         v_h,
-        merged_indices,
-        qblock_cu_seqlens,
+        merged_seg,
+        counts,
         o_h,
         lse,
         *q_h.stride(),
         *k_h.stride(),
         *v_h.stride(),
-        *merged_indices.stride(),
-        *qblock_cu_seqlens.stride(),
+        *merged_seg.stride(),
+        *counts.stride(),
         *o_h.stride(),
         lse.stride(0),
         lse.stride(1),
@@ -479,6 +532,7 @@ def flash_topk_attn(
         BV=BV,
         Q_PAD_HEAD=q_pad_head,
         KV_PAD_HEAD=kv_pad_head,
+        S_MAX=S_MAX,
     )
     return o_h.view(B, N, C), lse
 
@@ -488,7 +542,7 @@ def _flash_topk_attn_naive(
     k: torch.Tensor,
     v: torch.Tensor,
     merged_indices: torch.Tensor,
-    qblock_cu_seqlens: torch.Tensor,
+    counts: torch.Tensor,
     num_heads: int,
     q_block_size: int,
     kv_block_size: int,
@@ -518,7 +572,6 @@ def _flash_topk_attn_naive(
     k_f = rearrange(k, "b n (h d) -> b h n d", h=H).float()
     v_f = rearrange(v, "b n (h d) -> b h n d", h=H).float()
 
-    # H_BI is implicit in merged_indices/qblock_cu_seqlens; enforce in {1, H}.
     H_BI = merged_indices.shape[1]
     assert H_BI == 1 or H_BI == H
 
@@ -529,16 +582,15 @@ def _flash_topk_attn_naive(
 
     for b in range(B):
         for h in range(H):
+            h_bi = min(h, H_BI - 1)
             for qm in range(QM):
-                # Real query range for this q-block.
                 q_start = max(0, qm * Q_BS - q_pad_head)
                 q_end = min(N, (qm + 1) * Q_BS - q_pad_head)
                 if q_start >= q_end:
                     continue
 
-                start = qblock_cu_seqlens[b, h, qm].item()
-                end = qblock_cu_seqlens[b, h, qm + 1].item()
-                blocks = merged_indices[b, h, start:end]
+                count = counts[b, h_bi, qm].item()
+                blocks = merged_indices[b, h_bi, qm, :count]
                 blocks = blocks[blocks >= 0]
 
                 valid = torch.zeros(N, dtype=torch.bool, device=device)

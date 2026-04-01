@@ -140,17 +140,18 @@ o_full, topk_indices, topk_scores = flash_topk_score(
 # topk_indices: [B, H, N, topk]
 
 # 第 2 步：构建，按 q-block 聚合 per-query 索引为共享候选集
-merged_indices, cu_seqlens = build_qblock_topk_indices(
+merged_indices, counts, S_MAX = build_qblock_topk_indices(
     topk_indices,       # [B, H, N, topk]
     q_block_size=32,
 )
-# merged_indices: [B, H, S]      排序去重的 block id，-1 填充
-# cu_seqlens:     [B, H, QM+1]   每个 q-block 的累积长度
+# merged_indices: [B, H, QM, S_MAX]  排序去重的 block id，-1 填充
+# counts:         [B, H, QM]         每个 q-block 的有效索引数
+# S_MAX:          int                segment 大小
 
 # 第 3 步：注意力，仅对候选 block 计算稀疏注意力
 o_sparse, lse = flash_topk_attn(
     q, k, v,
-    merged_indices, cu_seqlens,
+    merged_indices, counts,
     num_heads=H,
     q_block_size=32,
     kv_block_size=64,   # 须与 score_block_size 一致
@@ -167,11 +168,11 @@ o_sparse, lse = flash_topk_attn(
 q_padding  = (8, 24)   # q_pad_head + N + q_pad_tail 须整除 q_block_size
 kv_padding = (0, 24)   # kv_pad_head + N + kv_pad_tail 须整除 kv_block_size
 
-merged_indices, cu_seqlens = build_qblock_topk_indices(
+merged_indices, counts, S_MAX = build_qblock_topk_indices(
     topk_indices, q_block_size=32, q_padding=q_padding,
 )
 o_sparse, lse = flash_topk_attn(
-    q, k, v, merged_indices, cu_seqlens,
+    q, k, v, merged_indices, counts,
     num_heads=H, q_block_size=32, kv_block_size=64,
     q_padding=q_padding, kv_padding=kv_padding,
 )
