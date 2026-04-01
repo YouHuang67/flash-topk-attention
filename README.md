@@ -50,7 +50,7 @@ Baselines: **Naive** = standard attention + `torch.topk` (two separate passes); 
 | 65,536 | 4 | 1,024 | 16 | — | 1.52x slower |
 | 262,144 | 4 | 4,096 | 16 | — | 1.57x slower |
 
-Naive materializes the full $N \times N$ attention matrix, causing GPU out-of-memory (OOM) at long sequences — computing block scores or finding $\text{top-}k$ indices becomes impossible.
+Naive materializes the full $N \times N$ attention matrix, causing GPU out-of-memory (OOM) at long sequences. Computing block scores or finding $\text{top-}k$ indices becomes impossible.
 
 Full benchmark results: [BENCHMARK.md](BENCHMARK.md)
 
@@ -78,7 +78,7 @@ from flash_topk_attn import flash_topk_score
 
 B, N, H, D = 2, 1024, 8, 64
 
-# 3D input: [B, N, C] where C = H * D — num_heads required
+# 3D input: [B, N, C] where C = H * D, num_heads required
 q = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
 k = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
 v = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
@@ -93,7 +93,7 @@ o, topk_indices, topk_scores = flash_topk_score(
 # topk_indices:  [B, H, N, topk]  int32 block ids
 # topk_scores:   [B, H, N, topk]  float32 block scores
 
-# 4D input: [B, H, N, D] — num_heads inferred from shape
+# 4D input: [B, H, N, D], num_heads inferred from shape
 q4 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
 k4 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
 v4 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
@@ -103,10 +103,10 @@ o4, topk_indices, topk_scores = flash_topk_score(
     score_block_size=64,
     topk=16,
 )
-# o4: [B, H, N, D] — output matches input layout
+# o4: [B, H, N, D]  output matches input layout
 ```
 
-**Virtual padding** — when `N` is not divisible by `score_block_size`:
+**Virtual padding** (when `N` is not divisible by `score_block_size`):
 
 ```python
 # N=1000 is not divisible by 64, pad to 1024
@@ -125,13 +125,13 @@ o, topk_indices, topk_scores = flash_topk_score(
 ```python
 from flash_topk_attn import flash_topk_score, flash_topk_attn, build_qblock_topk_indices
 
-# Step 1: Score — get per-query top-k block indices
+# Step 1: Score, get per-query top-k block indices
 o_full, topk_indices, topk_scores = flash_topk_score(
     q, k, v, num_heads=H, score_block_size=64, topk=16,
 )
 # topk_indices: [B, H, N, topk]
 
-# Step 2: Build — group per-query indices into per-q-block candidate sets
+# Step 2: Build, group per-query indices into per-q-block candidate sets
 merged_indices, cu_seqlens = build_qblock_topk_indices(
     topk_indices,       # [B, H, N, topk]
     q_block_size=32,
@@ -139,7 +139,7 @@ merged_indices, cu_seqlens = build_qblock_topk_indices(
 # merged_indices: [B, H, S]      sorted unique block ids, -1 padded
 # cu_seqlens:     [B, H, QM+1]   cumulative lengths per q-block
 
-# Step 3: Attend — sparse attention over candidate blocks
+# Step 3: Attend, sparse attention over candidate blocks
 o_sparse, lse = flash_topk_attn(
     q, k, v,
     merged_indices, cu_seqlens,
@@ -151,7 +151,7 @@ o_sparse, lse = flash_topk_attn(
 # lse:      [B, H, N]    log-sum-exp (float32)
 ```
 
-Steps 2 and 3 are decoupled — `merged_indices` can be reused across multiple attention calls (e.g. different layers sharing the same sparsity pattern).
+`merged_indices` can be reused across multiple attention calls (e.g. different layers sharing the same sparsity pattern).
 
 **Virtual padding** for sparse attention (independent Q and KV padding):
 
