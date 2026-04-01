@@ -92,6 +92,17 @@ def build_qblock_topk_indices(
     q_pad_head, q_pad_tail = q_padding
     device = topk_indices.device
 
+    if q_pad_head >= q_block_size:
+        raise ValueError(
+            f"q_pad_head={q_pad_head} must be < q_block_size={q_block_size}; "
+            "virtual padding should only complete partial blocks, not create new ones."
+        )
+    if q_pad_tail >= q_block_size:
+        raise ValueError(
+            f"q_pad_tail={q_pad_tail} must be < q_block_size={q_block_size}; "
+            "virtual padding should only complete partial blocks, not create new ones."
+        )
+
     N_Q_PADDED = q_pad_head + N + q_pad_tail
     assert (
         N_Q_PADDED % q_block_size == 0
@@ -457,6 +468,27 @@ def flash_topk_attn(
 
     kv_pad_head, kv_pad_tail = kv_padding
     q_pad_head, q_pad_tail = q_padding
+
+    if kv_pad_head >= KV_BS:
+        raise ValueError(
+            f"kv_pad_head={kv_pad_head} must be < kv_block_size={KV_BS}; "
+            "virtual padding should only complete partial blocks, not create new ones."
+        )
+    if kv_pad_tail >= KV_BS:
+        raise ValueError(
+            f"kv_pad_tail={kv_pad_tail} must be < kv_block_size={KV_BS}; "
+            "virtual padding should only complete partial blocks, not create new ones."
+        )
+    if q_pad_head >= Q_BS:
+        raise ValueError(
+            f"q_pad_head={q_pad_head} must be < q_block_size={Q_BS}; "
+            "virtual padding should only complete partial blocks, not create new ones."
+        )
+    if q_pad_tail >= Q_BS:
+        raise ValueError(
+            f"q_pad_tail={q_pad_tail} must be < q_block_size={Q_BS}; "
+            "virtual padding should only complete partial blocks, not create new ones."
+        )
 
     N_KV_PADDED = kv_pad_head + N + kv_pad_tail
     N_Q_PADDED = q_pad_head + N + q_pad_tail
