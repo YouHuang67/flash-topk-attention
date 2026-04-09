@@ -110,6 +110,20 @@ o4, topk_indices, topk_scores = flash_topk_score(
 # o4: [B, H, N, D]  output matches input layout
 ```
 
+**Score-only mode** — skips V loading and attention output, reducing SRAM usage and improving throughput (1.3–2.5x faster depending on topk):
+
+```python
+# No v needed, returns 2-tuple
+topk_indices, topk_scores = flash_topk_score(
+    q, k,
+    num_heads=H,
+    score_block_size=64,
+    topk=16,
+    score_only=True,      # pure scoring, no attention output
+    # backend="triton",   # default; only "triton" supported currently
+)
+```
+
 **Virtual padding** (when `N` is not divisible by `score_block_size`):
 
 ```python

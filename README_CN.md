@@ -110,6 +110,20 @@ o4, topk_indices, topk_scores = flash_topk_score(
 # o4: [B, H, N, D]  输出与输入 layout 一致
 ```
 
+**纯打分模式** — 跳过 V 加载与注意力输出计算，降低 SRAM 占用，吞吐量提升 1.3–2.5 倍（取决于 topk）：
+
+```python
+# 无需 v，返回 2 元组
+topk_indices, topk_scores = flash_topk_score(
+    q, k,
+    num_heads=H,
+    score_block_size=64,
+    topk=16,
+    score_only=True,      # 纯打分，不计算注意力输出
+    # backend="triton",   # 默认值；目前仅支持 "triton"
+)
+```
+
 **虚拟 padding**（当 `N` 不能整除 `score_block_size` 时）：
 
 ```python
