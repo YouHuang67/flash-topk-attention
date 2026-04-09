@@ -13,14 +13,11 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from flash_topk_attn.heuristic import (
+    heuristic_autotune,
+    heuristic_attention_fwd,
+)
 from flash_topk_attn.scoring import _next_power_of_2
-
-
-def _next_pow2(n: int) -> int:
-    p = 1
-    while p < n:
-        p <<= 1
-    return p
 
 
 @triton.jit
@@ -114,7 +111,7 @@ def build_qblock_topk_indices(
         topk_flat = F.pad(topk_flat, (0, 0, q_pad_head, q_pad_tail), value=-1)
 
     raw_size = q_block_size * KQ
-    BLOCK_SIZE = _next_pow2(raw_size)
+    BLOCK_SIZE = _next_power_of_2(raw_size)
     S_MAX = BLOCK_SIZE
     BH = B * H
 
@@ -248,7 +245,7 @@ def _qblock_accum_kv(
     return b_m, b_l, b_o
 
 
-@triton.autotune(
+@heuristic_autotune(
     configs=[
         triton.Config({"Q_TILE": q, "KV_TILE": kv}, num_warps=w, num_stages=s)
         for q in (16, 32)
@@ -257,6 +254,8 @@ def _qblock_accum_kv(
         for s in (2, 3)
     ],
     key=["Q_BS", "KV_BS", "D"],
+    heuristic_fn=heuristic_attention_fwd,
+    heuristic_key_args=["Q_BS", "KV_BS", "D"],
 )
 @triton.jit
 def _flash_topk_attn_fwd_kernel(

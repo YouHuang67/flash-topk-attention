@@ -8,6 +8,13 @@ import torch
 import triton
 import triton.language as tl
 
+from flash_topk_attn.heuristic import (
+    heuristic_autotune,
+    heuristic_scoring_fwd,
+    heuristic_scoring_dq,
+    heuristic_scoring_dkv,
+)
+
 
 def _next_power_of_2(x: int) -> int:
     """Return the smallest power of 2 >= x."""
@@ -73,12 +80,14 @@ MAX_KV_BS_IN_CONFIGS = 128
 MAX_ALLOWED_ENTRIES_PER_KV = 16
 
 
-@triton.autotune(
+@heuristic_autotune(
     configs=[
         triton.Config({'Q_BS': q, 'KV_BS': kv}, num_warps=4 if q < 64 else 8)
         for q in [16, 32, 64] for kv in [16, 32, 64, 128]
     ],
     key=['N', 'N_PADDED', 'SCORE_K', 'SCORE_BS', 'SCORE_BS_ORIG', 'IS_POW2'],
+    heuristic_fn=heuristic_scoring_fwd,
+    heuristic_key_args=['N', 'SCORE_BS_ORIG', 'D'],
 )
 @triton.jit
 def flash_scoring_kernel(
@@ -524,12 +533,14 @@ def flash_scoring_delta_kernel(
     tl.store(Delta + i_b * H * N + i_h * N + i_n, delta_val.to(Delta.dtype.element_ty))
 
 
-@triton.autotune(
+@heuristic_autotune(
     configs=[
         triton.Config({'Q_BS': q, 'KV_BS': kv}, num_warps=4 if q < 64 else 8)
         for q in [16, 32, 64] for kv in [16, 32, 64, 128]
     ],
     key=['N', 'D'],
+    heuristic_fn=heuristic_scoring_dq,
+    heuristic_key_args=['N', 'D'],
 )
 @triton.jit
 def flash_scoring_dq_kernel(
@@ -607,12 +618,14 @@ def flash_scoring_dq_kernel(
     tl.store(p_dq, b_dq.to(DQ.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.autotune(
+@heuristic_autotune(
     configs=[
         triton.Config({'KV_BS': kv, 'Q_BS': q}, num_warps=4 if kv < 64 else 8)
         for kv in [16, 32, 64, 128] for q in [16, 32, 64]
     ],
     key=['N', 'D'],
+    heuristic_fn=heuristic_scoring_dkv,
+    heuristic_key_args=['N', 'D'],
 )
 @triton.jit
 def flash_scoring_dkv_kernel(
