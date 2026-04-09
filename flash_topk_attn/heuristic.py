@@ -39,7 +39,43 @@ def heuristic_scoring_fwd(
                     KV_BS = kv
                     break
 
+    max_kv = SCORE_BS * 16
+    if max_kv >= 16:
+        KV_BS = min(KV_BS, max_kv)
+
     return {"Q_BS": Q_BS, "KV_BS": KV_BS, "num_warps": 4}
+
+
+def heuristic_pure_scoring_fwd(
+    N: int, SCORE_BS_ORIG: int, D: int,
+) -> Dict[str, int]:
+    SCORE_BS = _next_power_of_2(SCORE_BS_ORIG)
+    IS_POW2 = (SCORE_BS_ORIG == SCORE_BS)
+
+    if N <= 512:
+        Q_BS = 16
+    elif N <= 1024:
+        Q_BS = 32
+    else:
+        Q_BS = 128
+
+    if IS_POW2:
+        if N <= 1024 and D <= 64:
+            KV_BS = 64
+        else:
+            KV_BS = 32
+    else:
+        if N <= 1024:
+            KV_BS = 32
+        else:
+            KV_BS = 16
+
+    max_kv = SCORE_BS * 16
+    if max_kv >= 16:
+        KV_BS = min(KV_BS, max_kv)
+
+    num_warps = 8 if Q_BS >= 64 else 4
+    return {"Q_BS": Q_BS, "KV_BS": KV_BS, "num_warps": num_warps}
 
 
 def heuristic_scoring_dq(N: int, D: int) -> Dict[str, int]:

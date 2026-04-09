@@ -11,6 +11,7 @@ import triton.language as tl
 from flash_topk_attn.heuristic import (
     heuristic_autotune,
     heuristic_scoring_fwd,
+    heuristic_pure_scoring_fwd,
     heuristic_scoring_dq,
     heuristic_scoring_dkv,
 )
@@ -506,12 +507,14 @@ def flash_scoring_kernel(
     tl.store(p_indices, pool_indices.to(TopK_Indices.dtype.element_ty), boundary_check=(0,))
 
 
-@triton.autotune(
+@heuristic_autotune(
     configs=[
         triton.Config({'Q_BS': q, 'KV_BS': kv}, num_warps=4 if q < 64 else 8)
         for q in [16, 32, 64, 128] for kv in [16, 32, 64, 128]
     ],
     key=['N', 'N_PADDED', 'SCORE_K', 'SCORE_BS', 'SCORE_BS_ORIG', 'IS_POW2'],
+    heuristic_fn=heuristic_pure_scoring_fwd,
+    heuristic_key_args=['N', 'SCORE_BS_ORIG', 'D'],
 )
 @triton.jit
 def flash_pure_scoring_kernel(
