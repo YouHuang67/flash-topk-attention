@@ -20,7 +20,8 @@ def flash_topk_score(
     score_block_size: int = 64,
     topk: int = 16,
     padding: Tuple[int, int] = (0, 0),
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    threshold: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Block-level top-k scoring with Triton + CUDA auto-dispatch.
 
     Args:
@@ -28,13 +29,18 @@ def flash_topk_score(
         k: Key, same layout and dtype as ``q``.
         num_heads: Required for 3D input; optional for 4D.
         score_block_size: Tokens per score block.
-        topk: Number of top blocks to select.
+        topk: Maximum number of top blocks to select per query.
         padding: ``(pad_head, pad_tail)`` virtual padding.
+        threshold: Cumulative raw-score cutoff (V2 only). Blocks are
+            kept until cumulative raw score reaches this value or
+            ``topk`` blocks are selected. Defaults to 1.0 (keep all
+            top blocks up to ``topk``, equivalent to V1).
 
     Returns:
-        (topk_indices, topk_scores):
+        (topk_indices, topk_raw_scores, topk_avg_scores):
             - topk_indices: ``[B, H, N, topk]`` int32.
-            - topk_scores: ``[B, H, N, topk]`` float32 (raw block scores).
+            - topk_raw_scores: ``[B, H, N, topk]`` float32.
+            - topk_avg_scores: ``[B, H, N, topk]`` float32.
     """
     input_4d = q.ndim == 4
     if input_4d:
@@ -52,17 +58,19 @@ def flash_topk_score(
         q, k, num_heads=num_heads,
         score_block_size=score_block_size, padding=padding,
     )
-    topk_indices, topk_raw, _topk_avg = flash_topk_select(
-        block_scores, threshold=1.0, max_topk=topk,
+    topk_indices, topk_raw, topk_avg = flash_topk_select(
+        block_scores, threshold=threshold, max_topk=topk,
         score_block_size=score_block_size, padding=padding,
     )
-    return topk_indices, topk_raw
+    return topk_indices, topk_raw, topk_avg
 
 
 def build_qblock_topk_indices(
     topk_indices: torch.Tensor,
     q_block_size: int,
     q_padding: Tuple[int, int] = (0, 0),
+    topk_scores: Optional[torch.Tensor] = None,
+    qblock_topk: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """Build per-qblock merged indices from per-query topk indices.
 
@@ -70,6 +78,13 @@ def build_qblock_topk_indices(
         topk_indices: ``[B, H, N, K]`` int32, ``-1`` for padding.
         q_block_size: Queries per qblock.
         q_padding: ``(q_pad_head, q_pad_tail)`` virtual Q padding.
+        topk_scores: ``[B, H, N, K]`` float32 (avg scores from
+            ``flash_topk_score``). When provided, q-block merging uses
+            score-weighted scatter-add. When ``None``, falls back to
+            uniform weights (V1 equivalent).
+        qblock_topk: Number of top blocks to keep per q-block after
+            merging. Defaults to ``q_block_size * K`` (V1 equivalent,
+            keeps all unique blocks).
 
     Returns:
         (merged_indices, counts, S_MAX):
@@ -106,15 +121,22 @@ def build_qblock_topk_indices(
     if q_pad_head > 0 or q_pad_tail > 0:
         idx = F.pad(idx, (0, 0, q_pad_head, q_pad_tail), value=-1)
 
-    qblock_topk = q_block_size * K
+    if qblock_topk is None:
+        qblock_topk = q_block_size * K
+
     valid_mask = idx >= 0
     if valid_mask.any():
         num_score_blocks = idx[valid_mask].max().item() + 1
     else:
         num_score_blocks = 1
 
-    scores = torch.ones(idx.shape, dtype=torch.float32, device=device)
-    scores[~valid_mask] = 0.0
+    if topk_scores is not None:
+        scores = topk_scores.float().contiguous()
+        if q_pad_head > 0 or q_pad_tail > 0:
+            scores = F.pad(scores, (0, 0, q_pad_head, q_pad_tail), value=0.0)
+    else:
+        scores = torch.ones(idx.shape, dtype=torch.float32, device=device)
+        scores[~valid_mask] = 0.0
 
     merged_indices, _merged_scores = flash_qblock_merge(
         idx, scores,
