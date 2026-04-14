@@ -153,7 +153,7 @@ V2 在所有配置下比 V1 快 **2x–4x**（RTX 4090, bfloat16）：
 | 1 | 5,056 | 32 | 128 | 64 | 16 | 33.97 ms | 11.42 ms | **3.0x** |
 | 1 | 4,096 | 32 | 64 | 64 | 16 | 9.37 ms | 4.47 ms | **2.1x** |
 
-各阶段详细数据：[V2_BENCHMARK.md](V2_BENCHMARK.md)
+各阶段详细数据：[V2_BENCHMARK_CN.md](V2_BENCHMARK_CN.md)
 
 ### V1 打分 vs 基线
 
@@ -176,10 +176,12 @@ Naive 需要展开完整的 $N \times N$ 注意力矩阵，在长序列下会导
 
 V2 将 V1 的融合内核拆分为四个算子，各自自动选择 Triton / CUDA 后端：
 
-1. **Block Scoring** — per-query per-block softmax 概率质量
-2. **Top-K Selection** — 按均值分数排序，累积原始分数截断
-3. **Q-Block Merging** — scatter-add per-query 分数，排序 + 截断
-4. **Sparse Attention** — 基于 merged indices 的 block-sparse flash attention
+1. **Block Scoring** — 计算 per-query per-block softmax 概率质量 $s_j$（与 V1 相同），但作为独立算子，不含 top-k 选取
+2. **Top-K Selection** — 取代 V1 的在线 Bitonic Sort，采用两步流程：先按均值分数排序（$\text{avg} = \text{raw} / \text{valid\_count}$，保证虚拟 padding 下完整 block 与部分 block 公平排序），再沿排序顺序累积原始分数，直到累积和达到 `threshold` 或选满 `max_topk` 个 block
+3. **Q-Block Merging** — 取代 V1 的精确集合并集，采用分数加权合并：将每个 query 的 top-k 均值分数 scatter-add 到每 qblock 共享的 $[M]$ 大小累加器，然后降序排序取前 `qblock_topk` 个 block
+4. **Sparse Attention** — 基于 merged indices 的 CUDA CuTe MMA flash attention
+
+设置 `threshold=1.0` 且 `qblock_topk = q_block_size * K` 可精确复现 V1 的行为。
 
 | 算子 | Triton | CUDA | 自动规则 |
 |------|:------:|:----:|---------|

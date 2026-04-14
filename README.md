@@ -176,10 +176,12 @@ Naive materializes the full $N \times N$ attention matrix, causing GPU out-of-me
 
 V2 decomposes the fused V1 kernel into four operators with Triton + CUDA backend auto-dispatch:
 
-1. **Block Scoring** — per-query per-block softmax probability mass
-2. **Top-K Selection** — sort by avg score, cumulative raw-score truncation
-3. **Q-Block Merging** — scatter-add per-query scores, sort + truncate per qblock
-4. **Sparse Attention** — block-sparse flash attention over merged indices
+1. **Block Scoring** — computes per-query per-block softmax probability mass $s_j$ (same as V1), but as a standalone operator without top-k selection
+2. **Top-K Selection** — replaces V1's online Bitonic Sort with a two-step process: sort blocks by average score ($\text{avg} = \text{raw} / \text{valid\_count}$, ensuring fair ranking with virtual padding), then walk the sorted order accumulating raw scores until the cumulative sum reaches `threshold` or `max_topk` blocks are selected — whichever comes first
+3. **Q-Block Merging** — replaces V1's exact set union with a score-weighted merge: scatter-add each query's top-k average scores into a shared $[M]$-sized accumulator per qblock, then sort descending and keep the top `qblock_topk` blocks
+4. **Sparse Attention** — CUDA CuTe MMA flash attention over the merged block indices
+
+Setting `threshold=1.0` and `qblock_topk = q_block_size * K` reproduces V1's exact behavior.
 
 | Operator | Triton | CUDA | Auto rule |
 |----------|:------:|:----:|-----------|
