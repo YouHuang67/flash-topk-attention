@@ -2,13 +2,18 @@
 
 # Flash TopK Attention
 
-融合 Flash Attention、top-k KV block 打分与稀疏注意力的 Triton 内核。在计算注意力输出的同时对每个 query 的 KV block 按聚合注意力概率打分，返回 top-k block 索引，用于下游稀疏注意力计算。
+融合 Flash Attention、top-k KV block 打分与稀疏注意力的内核库。
+
+- **V1** (`flash_topk_attn`)：单个融合 Triton 内核 — 在一次 KV 遍历中完成 block 打分、top-k 选取和注意力输出。
+- **V2** (`flash_topk_attn_v2`)：与 V1 相同的 API，**2x–4x 加速** — 内部使用模块化的 Triton + CUDA 流水线。
+
+---
 
 ## 算法
 
 ### 打分（Scoring）
 
-标准 Flash Attention 利用 online softmax 技巧计算 $O = \text{softmax}(QK^\top / \sqrt{D})\ V$，通过逐 block 迭代 KV 避免展开完整的 $N \times N$ 矩阵。其中 $B$ 为 batch size, $N$ 为序列长度, $H$ 为注意力头数, $D$ 为每头维度。
+标准 Flash Attention 利用 online softmax 技巧计算 $O = \text{softmax}(QK^\top / \sqrt{D})\ V$，通过逐 block 迭代 KV 避免展开完整的 $N \times N$ 矩阵。其中 $B$ 为 batch size，$N$ 为序列长度，$H$ 为注意力头数，$D$ 为每头维度。
 
 本内核在此基础上将 KV 序列划分为 $M = N / b$ 个不重叠的 block，每个 block 大小为 $b$，并为每个 block $j$ 计算**块级注意力分数**：
 
@@ -18,11 +23,11 @@ $$s_j = \sum_{i \ \in\  \text{block}_j} p_i, \qquad p_i = \frac{\exp(q_t k_i^\to
 
 $$\mathbf{I} = \underset{j \in \{1,\ldots,M\}}{\text{argtop-}k}\ s_j,$$
 
-在 KV 迭代过程中通过在线 Bitonic Sort 维护 $\text{top-}k$ 池完成选取，无需对 KV 进行第二次遍历。输出 $\mathbf{I}$ 的形状为 $[B, H, N, k]$，可驱动后续稀疏注意力计算，将每 token 的 KV 访问量从 $O(N)$ 降至 $O(k \cdot b)$。
+输出 $\mathbf{I}$ 的形状为 $[B, H, N, k]$，可驱动后续稀疏注意力计算，将每 token 的 KV 访问量从 $O(N)$ 降至 $O(k \cdot b)$。
 
 ### 稀疏注意力（Sparse Attention）
 
-基于打分阶段得到的 $\text{top-}k$ block 索引 $\mathbf{I}$，`flash_topk_attn` 仅对选中的 KV block 计算注意力。
+基于打分阶段得到的 $\text{top-}k$ block 索引 $\mathbf{I}$，稀疏注意力仅对选中的 KV block 计算输出。
 
 **Q-Block 共享候选机制**：将 query 按大小 $g$（`q_block_size`）分组。对于第 $m$ 个 query 块（覆盖 query $[mg,\ (m+1)g)$），取组内所有 query 的 top-k 索引的并集，构造共享候选集：
 
@@ -39,11 +44,120 @@ $$O_t = \sum_{j \in \mathcal{C}_m} \frac{\exp(q_t k_j^\top / \sqrt{D})}{\sum_{j'
 
 ### 虚拟 Padding
 
-当 N 不能整除 block 大小 b 时，虚拟 padding 将序列扩展为 N' = pad_head + N + pad_tail，使 N' 能被 b 整除。Padding 纯为逻辑概念，QKV 数据不变，padding 位置在 softmax 前被掩码为负无穷。对于头尾的不完整 block，block 分数按有效 token 数归一化，保证完整 block 与部分 block 之间 top-k 排序公平。`flash_topk_attn` 中 Q 侧与 KV 侧 padding 独立指定。
+当 N 不能整除 block 大小 b 时，虚拟 padding 将序列扩展为 N' = pad_head + N + pad_tail，使 N' 能被 b 整除。Padding 纯为逻辑概念，QKV 数据不变，padding 位置在 softmax 前被掩码为负无穷。对于头尾的不完整 block，block 分数按有效 token 数归一化，保证完整 block 与部分 block 之间 top-k 排序公平。
+
+---
+
+## 使用方法
+
+V1 与 V2 共享相同的 3 函数 API。将 `flash_topk_attn` 替换为 `flash_topk_attn_v2` 即可使用更快的后端。
+
+### 打分
+
+```python
+import torch
+from flash_topk_attn import flash_topk_score       # V1
+# from flash_topk_attn_v2 import flash_topk_score  # V2（相同 API，更快）
+
+B, N, H, D = 2, 1024, 8, 64
+q = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
+k = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
+
+topk_indices, topk_scores = flash_topk_score(
+    q, k,
+    num_heads=H,
+    score_block_size=64,
+    topk=16,
+)
+# topk_indices: [B, H, N, topk] int32
+# topk_scores:  [B, H, N, topk] float32
+```
+
+V1 还支持 `score_only=False`，在打分的同时返回注意力输出：
+
+```python
+v = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
+o, topk_indices, topk_scores = flash_topk_score(
+    q, k, v, num_heads=H, score_block_size=64, topk=16,
+)
+# o: [B, N, C]  注意力输出（仅 V1）
+```
+
+### 稀疏注意力
+
+```python
+from flash_topk_attn import flash_topk_score, flash_topk_attn, build_qblock_topk_indices
+# from flash_topk_attn_v2 import flash_topk_score, flash_topk_attn, build_qblock_topk_indices
+
+# 第 1 步：打分 — 获取 per-query top-k block 索引
+topk_indices, topk_scores = flash_topk_score(
+    q, k, num_heads=H, score_block_size=64, topk=16,
+)
+
+# 第 2 步：构建 — 按 q-block 聚合 per-query 索引为共享候选集
+merged_indices, counts, S_MAX = build_qblock_topk_indices(
+    topk_indices, q_block_size=32,
+)
+# merged_indices: [B, H, QM, S_MAX]  排序去重的 block id，-1 填充
+# counts:         [B, H, QM]         每个 q-block 的有效索引数
+
+# 第 3 步：注意力 — 仅对候选 block 计算稀疏注意力
+o_sparse, lse = flash_topk_attn(
+    q, k, v, merged_indices, counts,
+    num_heads=H, q_block_size=32, kv_block_size=64,
+)
+# o_sparse: [B, N, C]   稀疏注意力输出
+# lse:      [B, H, N]   log-sum-exp (float32)
+```
+
+`merged_indices` 可跨多次注意力调用复用（如多层共享相同稀疏模式）。
+
+### 虚拟 Padding
+
+```python
+# N=1000 不能整除 64，pad 到 1024
+topk_indices, topk_scores = flash_topk_score(
+    q, k, num_heads=H, score_block_size=64, topk=16,
+    score_only=True, padding=(0, 24),  # score_only 仅 V1
+)
+
+# Q 侧与 KV 侧 padding 独立指定
+q_padding  = (8, 24)   # q_pad_head + N + q_pad_tail 须整除 q_block_size
+kv_padding = (0, 24)   # kv_pad_head + N + kv_pad_tail 须整除 kv_block_size
+
+merged_indices, counts, S_MAX = build_qblock_topk_indices(
+    topk_indices, q_block_size=32, q_padding=q_padding,
+)
+o_sparse, lse = flash_topk_attn(
+    q, k, v, merged_indices, counts,
+    num_heads=H, q_block_size=32, kv_block_size=64,
+    q_padding=q_padding, kv_padding=kv_padding,
+)
+```
+
+---
 
 ## 性能
 
-基线说明：**Naive** = 标准注意力 + `torch.topk`（两次独立 pass）；**FA2** = 仅 Flash Attention 2 前向，不含 TopK 计分（性能下界）。
+### V2 vs V1 端到端
+
+V2 在所有配置下比 V1 快 **2x–4x**（RTX 4090, bfloat16）：
+
+| B | N | H | D | Block Size | Top-K | V1 | V2 | 加速比 |
+|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| 1 | 4,096 | 32 | 128 | 64 | 16 | 22.01 ms | 7.26 ms | **3.0x** |
+| 1 | 8,192 | 32 | 128 | 64 | 16 | 87.25 ms | 28.15 ms | **3.1x** |
+| 1 | 4,096 | 32 | 128 | 64 | 32 | 29.82 ms | 7.37 ms | **4.0x** |
+| 2 | 4,096 | 32 | 128 | 64 | 16 | 43.44 ms | 14.42 ms | **3.0x** |
+| 1 | 4,032 | 32 | 128 | 48 | 16 | 37.33 ms | 11.25 ms | **3.3x** |
+| 1 | 5,056 | 32 | 128 | 64 | 16 | 33.97 ms | 11.42 ms | **3.0x** |
+| 1 | 4,096 | 32 | 64 | 64 | 16 | 9.37 ms | 4.47 ms | **2.1x** |
+
+各阶段详细数据：[V2_BENCHMARK.md](V2_BENCHMARK.md)
+
+### V1 打分 vs 基线
+
+**Naive** = 标准注意力 + `torch.topk`（两次独立 pass）；**FA2** = 仅 Flash Attention 2 前向，不含 TopK 计分（性能下界）。
 
 | 序列长度 | 注意力头数 | Block 大小 | Top-K | 对比 Naive 加速比 | 对比 FA2 额外开销 |
 |:-:|:-:|:-:|:-:|:-:|:-:|
@@ -54,9 +168,29 @@ $$O_t = \sum_{j \in \mathcal{C}_m} \frac{\exp(q_t k_j^\top / \sqrt{D})}{\sum_{j'
 | 65,536 | 4 | 1,024 | 16 | — | 1.52x 减速 |
 | 262,144 | 4 | 4,096 | 16 | — | 1.57x 减速 |
 
-Naive 需要展开完整的 $N \times N$ 注意力矩阵，在长序列下会导致 GPU 显存不足 (OOM)，无法计算 block 分数也无法找到 $\text{top-}k$ 索引。
+Naive 需要展开完整的 $N \times N$ 注意力矩阵，在长序列下会导致 GPU 显存不足 (OOM)。完整 benchmark：[BENCHMARK.md](BENCHMARK.md)
 
-完整 benchmark 数据：[BENCHMARK_CN.md](BENCHMARK_CN.md)
+---
+
+## V2 内部实现
+
+V2 将 V1 的融合内核拆分为四个算子，各自自动选择 Triton / CUDA 后端：
+
+1. **Block Scoring** — per-query per-block softmax 概率质量
+2. **Top-K Selection** — 按均值分数排序，累积原始分数截断
+3. **Q-Block Merging** — scatter-add per-query 分数，排序 + 截断
+4. **Sparse Attention** — 基于 merged indices 的 block-sparse flash attention
+
+| 算子 | Triton | CUDA | 自动规则 |
+|------|:------:|:----:|---------|
+| Block Scoring | 所有 D | D_kernel >= 80 | D_kernel < 80 → Triton |
+| Top-K Selection | M_PAD <= 512 | M <= 4096 | M_PAD <= 128 → Triton |
+| Q-Block Merging | — | 始终 | 仅 CUDA |
+| Sparse Attention | — | 始终 | 仅 CUDA |
+
+D_kernel 为 head 维度向上取整到最近的支持值 (32, 64, 96, 128, 160, 256)。
+
+---
 
 ## 环境要求
 
@@ -72,126 +206,18 @@ pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 pip install -e .
 ```
 
-## 使用方法
-
-### 打分
-
-```python
-import torch
-from flash_topk_attn import flash_topk_score
-
-B, N, H, D = 2, 1024, 8, 64
-
-# 3D 输入: [B, N, C]，C = H * D，必须指定 num_heads
-q = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
-k = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
-v = torch.randn(B, N, H * D, device="cuda", dtype=torch.float16)
-
-o, topk_indices, topk_scores = flash_topk_score(
-    q, k, v,
-    num_heads=H,
-    score_block_size=64,
-    topk=16,
-)
-# o:             [B, N, C]        注意力输出
-# topk_indices:  [B, H, N, topk]  int32 block 索引
-# topk_scores:   [B, H, N, topk]  float32 block 分数
-
-# 4D 输入: [B, H, N, D]，自动推断 num_heads
-q4 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
-k4 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
-v4 = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
-
-o4, topk_indices, topk_scores = flash_topk_score(
-    q4, k4, v4,
-    score_block_size=64,
-    topk=16,
-)
-# o4: [B, H, N, D]  输出与输入 layout 一致
-```
-
-**纯打分模式** — 跳过 V 加载与注意力输出计算，降低 SRAM 占用，吞吐量提升 1.3–2.5 倍（取决于 topk）：
-
-```python
-# 无需 v，返回 2 元组
-topk_indices, topk_scores = flash_topk_score(
-    q, k,
-    num_heads=H,
-    score_block_size=64,
-    topk=16,
-    score_only=True,      # 纯打分，不计算注意力输出
-    # backend="triton",   # 默认值；目前仅支持 "triton"
-)
-```
-
-**虚拟 padding**（当 `N` 不能整除 `score_block_size` 时）：
-
-```python
-# N=1000 不能整除 64，pad 到 1024
-o, topk_indices, topk_scores = flash_topk_score(
-    q, k, v,
-    num_heads=H,
-    score_block_size=64,
-    topk=16,
-    padding=(0, 24),  # pad_head + N + pad_tail 须整除 score_block_size
-)
-# QKV 数据不变；padding 纯逻辑概念
-```
-
-### 稀疏注意力
-
-```python
-from flash_topk_attn import flash_topk_score, flash_topk_attn, build_qblock_topk_indices
-
-# 第 1 步：打分，获取每个 query 的 top-k block 索引
-o_full, topk_indices, topk_scores = flash_topk_score(
-    q, k, v, num_heads=H, score_block_size=64, topk=16,
-)
-# topk_indices: [B, H, N, topk]
-
-# 第 2 步：构建，按 q-block 聚合 per-query 索引为共享候选集
-merged_indices, counts, S_MAX = build_qblock_topk_indices(
-    topk_indices,       # [B, H, N, topk]
-    q_block_size=32,
-)
-# merged_indices: [B, H, QM, S_MAX]  排序去重的 block id，-1 填充
-# counts:         [B, H, QM]         每个 q-block 的有效索引数
-# S_MAX:          int                segment 大小
-
-# 第 3 步：注意力，仅对候选 block 计算稀疏注意力
-o_sparse, lse = flash_topk_attn(
-    q, k, v,
-    merged_indices, counts,
-    num_heads=H,
-    q_block_size=32,
-    kv_block_size=64,   # 须与 score_block_size 一致
-)
-# o_sparse: [B, N, C]    稀疏注意力输出
-# lse:      [B, H, N]    log-sum-exp (float32)
-```
-
-`merged_indices` 可跨多次注意力调用复用（如多层共享相同稀疏模式）。
-
-**虚拟 padding**（Q 和 KV 独立 padding）：
-
-```python
-q_padding  = (8, 24)   # q_pad_head + N + q_pad_tail 须整除 q_block_size
-kv_padding = (0, 24)   # kv_pad_head + N + kv_pad_tail 须整除 kv_block_size
-
-merged_indices, counts, S_MAX = build_qblock_topk_indices(
-    topk_indices, q_block_size=32, q_padding=q_padding,
-)
-o_sparse, lse = flash_topk_attn(
-    q, k, v, merged_indices, counts,
-    num_heads=H, q_block_size=32, kv_block_size=64,
-    q_padding=q_padding, kv_padding=kv_padding,
-)
-```
-
 ## Todo
 
-- [x] Flash Scoring 内核
-- [x] 稀疏注意力内核
+### V1
+- [x] Flash Scoring 内核（融合打分 + top-k + 注意力）
+- [x] 稀疏注意力内核（q-block 共享候选）
+
+### V2
+- [x] Block Scoring（Triton + CUDA 自动分发）
+- [x] Top-K Selection（Triton + CUDA 自动分发）
+- [x] Q-Block Merging（CUDA）
+- [x] Sparse Attention（CUDA）
+- [ ] 反向传播
 
 ## 许可证
 
