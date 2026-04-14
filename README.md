@@ -4,8 +4,8 @@ English | [中文](README_CN.md)
 
 A fused kernel library for Flash Attention with top-k KV block scoring and sparse attention.
 
-- **V1** (`flash_topk_attn`): Single fused Triton kernel — scores KV blocks, selects top-k, and computes attention output in one pass.
-- **V2** (`flash_topk_attn_v2`): Same API as V1, **2x–4x faster** — internally uses a modular Triton + CUDA pipeline.
+- **V1** (`flash_topk_attn`): Single fused Triton kernel that scores KV blocks, selects top-k, and computes attention output in one pass.
+- **V2** (`flash_topk_attn_v2`): Same API as V1, **2x–4x faster**. Internally uses a modular Triton + CUDA pipeline.
 
 ---
 
@@ -89,19 +89,19 @@ o, topk_indices, topk_scores = flash_topk_score(
 from flash_topk_attn import flash_topk_score, flash_topk_attn, build_qblock_topk_indices
 # from flash_topk_attn_v2 import flash_topk_score, flash_topk_attn, build_qblock_topk_indices
 
-# Step 1: Score — per-query top-k block indices
+# Step 1: Score, per-query top-k block indices
 topk_indices, topk_scores = flash_topk_score(
     q, k, num_heads=H, score_block_size=64, topk=16,
 )
 
-# Step 2: Build — group per-query indices into per-q-block candidate sets
+# Step 2: Build, group per-query indices into per-q-block candidate sets
 merged_indices, counts, S_MAX = build_qblock_topk_indices(
     topk_indices, q_block_size=32,
 )
 # merged_indices: [B, H, QM, S_MAX]  sorted unique block ids, -1 padded
 # counts:         [B, H, QM]         valid count per q-block
 
-# Step 3: Attend — sparse attention over candidate blocks
+# Step 3: Attend, sparse attention over candidate blocks
 o_sparse, lse = flash_topk_attn(
     q, k, v, merged_indices, counts,
     num_heads=H, q_block_size=32, kv_block_size=64,
@@ -174,21 +174,24 @@ Naive materializes the full $N \times N$ attention matrix, causing GPU out-of-me
 
 ## V2 Internals
 
-V2 decomposes the fused V1 kernel into four operators with Triton + CUDA backend auto-dispatch:
+V2 decomposes the fused V1 kernel into four operators, each with Triton + CUDA backend auto-dispatch.
 
-1. **Block Scoring** — computes per-query per-block softmax probability mass $s_j$ (same as V1), but as a standalone operator without top-k selection
-2. **Top-K Selection** — replaces V1's online Bitonic Sort with a two-step process: sort blocks by average score ($\text{avg} = \text{raw} / \text{valid\_count}$, ensuring fair ranking with virtual padding), then walk the sorted order accumulating raw scores until the cumulative sum reaches `threshold` or `max_topk` blocks are selected — whichever comes first
-3. **Q-Block Merging** — replaces V1's exact set union with a score-weighted merge: scatter-add each query's top-k average scores into a shared $[M]$-sized accumulator per qblock, then sort descending and keep the top `qblock_topk` blocks
-4. **Sparse Attention** — CUDA CuTe MMA flash attention over the merged block indices
+**Block Scoring.** Computes per-query per-block softmax probability mass $s_j$, same as V1 but as a standalone operator without top-k selection.
+
+**Top-K Selection.** Replaces V1's online Bitonic Sort with a two-step process. First, blocks are sorted by average score $s_j^{\text{avg}} = s_j / n_j$ where $n_j$ is the number of valid tokens in block $j$, ensuring fair ranking between full and partial blocks under virtual padding. Then, walking the sorted order, raw scores are accumulated until the cumulative sum reaches `threshold` or `max_topk` blocks are selected, whichever comes first.
+
+**Q-Block Merging.** Replaces V1's exact set union with a score-weighted merge. For each query in a q-block, its per-query top-k average scores are scatter-added into a shared $[M]$-sized accumulator indexed by block id. The accumulated scores are then sorted descending, and the top `qblock_topk` blocks are kept.
+
+**Sparse Attention.** CUDA CuTe MMA flash attention over the merged block indices.
 
 Setting `threshold=1.0` and `qblock_topk = q_block_size * K` reproduces V1's exact behavior.
 
 | Operator | Triton | CUDA | Auto rule |
 |----------|:------:|:----:|-----------|
-| Block Scoring | all D | D_kernel >= 80 | D_kernel < 80 → Triton |
-| Top-K Selection | M_PAD <= 512 | M <= 4096 | M_PAD <= 128 → Triton |
-| Q-Block Merging | — | always | CUDA only |
-| Sparse Attention | — | always | CUDA only |
+| Block Scoring | all D | D_kernel >= 80 | D_kernel < 80 then Triton |
+| Top-K Selection | M_PAD <= 512 | M <= 4096 | M_PAD <= 128 then Triton |
+| Q-Block Merging | n/a | always | CUDA only |
+| Sparse Attention | n/a | always | CUDA only |
 
 D_kernel is the head dimension padded to the nearest supported value in (32, 64, 96, 128, 160, 256).
 

@@ -4,8 +4,8 @@
 
 融合 Flash Attention、top-k KV block 打分与稀疏注意力的内核库。
 
-- **V1** (`flash_topk_attn`)：单个融合 Triton 内核 — 在一次 KV 遍历中完成 block 打分、top-k 选取和注意力输出。
-- **V2** (`flash_topk_attn_v2`)：与 V1 相同的 API，**2x–4x 加速** — 内部使用模块化的 Triton + CUDA 流水线。
+- **V1** (`flash_topk_attn`)：单个融合 Triton 内核，在一次 KV 遍历中完成 block 打分、top-k 选取和注意力输出。
+- **V2** (`flash_topk_attn_v2`)：与 V1 相同的 API，**2x–4x 加速**。内部使用模块化的 Triton + CUDA 流水线。
 
 ---
 
@@ -89,19 +89,19 @@ o, topk_indices, topk_scores = flash_topk_score(
 from flash_topk_attn import flash_topk_score, flash_topk_attn, build_qblock_topk_indices
 # from flash_topk_attn_v2 import flash_topk_score, flash_topk_attn, build_qblock_topk_indices
 
-# 第 1 步：打分 — 获取 per-query top-k block 索引
+# 第 1 步：打分，获取 per-query top-k block 索引
 topk_indices, topk_scores = flash_topk_score(
     q, k, num_heads=H, score_block_size=64, topk=16,
 )
 
-# 第 2 步：构建 — 按 q-block 聚合 per-query 索引为共享候选集
+# 第 2 步：构建，按 q-block 聚合 per-query 索引为共享候选集
 merged_indices, counts, S_MAX = build_qblock_topk_indices(
     topk_indices, q_block_size=32,
 )
 # merged_indices: [B, H, QM, S_MAX]  排序去重的 block id，-1 填充
 # counts:         [B, H, QM]         每个 q-block 的有效索引数
 
-# 第 3 步：注意力 — 仅对候选 block 计算稀疏注意力
+# 第 3 步：注意力，仅对候选 block 计算稀疏注意力
 o_sparse, lse = flash_topk_attn(
     q, k, v, merged_indices, counts,
     num_heads=H, q_block_size=32, kv_block_size=64,
@@ -174,21 +174,24 @@ Naive 需要展开完整的 $N \times N$ 注意力矩阵，在长序列下会导
 
 ## V2 内部实现
 
-V2 将 V1 的融合内核拆分为四个算子，各自自动选择 Triton / CUDA 后端：
+V2 将 V1 的融合内核拆分为四个算子，各自自动选择 Triton / CUDA 后端。
 
-1. **Block Scoring** — 计算 per-query per-block softmax 概率质量 $s_j$（与 V1 相同），但作为独立算子，不含 top-k 选取
-2. **Top-K Selection** — 取代 V1 的在线 Bitonic Sort，采用两步流程：先按均值分数排序（$\text{avg} = \text{raw} / \text{valid\_count}$，保证虚拟 padding 下完整 block 与部分 block 公平排序），再沿排序顺序累积原始分数，直到累积和达到 `threshold` 或选满 `max_topk` 个 block
-3. **Q-Block Merging** — 取代 V1 的精确集合并集，采用分数加权合并：将每个 query 的 top-k 均值分数 scatter-add 到每 qblock 共享的 $[M]$ 大小累加器，然后降序排序取前 `qblock_topk` 个 block
-4. **Sparse Attention** — 基于 merged indices 的 CUDA CuTe MMA flash attention
+**Block Scoring.** 计算 per-query per-block softmax 概率质量 $s_j$，与 V1 相同，但作为独立算子，不含 top-k 选取。
+
+**Top-K Selection.** 取代 V1 的在线 Bitonic Sort，采用两步流程。首先按均值分数 $s_j^{\text{avg}} = s_j / n_j$ 降序排列，其中 $n_j$ 为 block $j$ 中有效 token 数，保证虚拟 padding 下完整 block 与部分 block 公平排序。然后沿排序顺序累积原始分数，直到累积和达到 `threshold` 或选满 `max_topk` 个 block。
+
+**Q-Block Merging.** 取代 V1 的精确集合并集，采用分数加权合并。对 q-block 内每个 query，将其 top-k 均值分数 scatter-add 到按 block id 索引的共享 $[M]$ 大小累加器中。累加完成后降序排序，取前 `qblock_topk` 个 block。
+
+**Sparse Attention.** 基于 merged indices 的 CUDA CuTe MMA flash attention。
 
 设置 `threshold=1.0` 且 `qblock_topk = q_block_size * K` 可精确复现 V1 的行为。
 
 | 算子 | Triton | CUDA | 自动规则 |
 |------|:------:|:----:|---------|
-| Block Scoring | 所有 D | D_kernel >= 80 | D_kernel < 80 → Triton |
-| Top-K Selection | M_PAD <= 512 | M <= 4096 | M_PAD <= 128 → Triton |
-| Q-Block Merging | — | 始终 | 仅 CUDA |
-| Sparse Attention | — | 始终 | 仅 CUDA |
+| Block Scoring | 所有 D | D_kernel >= 80 | D_kernel < 80 用 Triton |
+| Top-K Selection | M_PAD <= 512 | M <= 4096 | M_PAD <= 128 用 Triton |
+| Q-Block Merging | 无 | 始终 | 仅 CUDA |
+| Sparse Attention | 无 | 始终 | 仅 CUDA |
 
 D_kernel 为 head 维度向上取整到最近的支持值 (32, 64, 96, 128, 160, 256)。
 
