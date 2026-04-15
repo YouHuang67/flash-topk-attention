@@ -40,6 +40,19 @@ V1 sparse attention is a Triton kernel; V2 uses a CUDA CuTe MMA kernel. The 2.3x
 | 1 | 4,096 | 4 | 64 | 64 | 16 | 0.87 ms | 0.38 ms | **2.3x** |
 | 1 | 4,096 | 32 | 64 | 64 | 16 | 5.84 ms | 2.28 ms | **2.6x** |
 
+### Sparse Attention: Varying D (RTX 3090, bfloat16)
+
+B=1, H=8, N=2048, Block Size=64, Top-K=8. V1 Triton has a known BD truncation bug for D > 128, so only V2 vs naive correctness is verified for those cases.
+
+| D | V1 | V2 | Speedup |
+|:-:|:-:|:-:|:-:|
+| 32 | 0.079 ms | 0.065 ms | **1.22x** |
+| 48 | 0.122 ms | 0.140 ms | 0.87x |
+| 64 | 0.133 ms | 0.108 ms | **1.24x** |
+| 80 | 0.333 ms | 0.203 ms | **1.64x** |
+| 96 | 0.335 ms | 0.154 ms | **2.18x** |
+| 128 | 0.339 ms | 0.182 ms | **1.86x** |
+
 ## End-to-End Pipeline (scoring + merge + attention)
 
 V2 total includes `flash_block_score` + `flash_topk_select` + `flash_qblock_merge` + `flash_sparse_attn`. The merge step (`flash_qblock_merge`) adds < 0.2 ms overhead across all cases.
