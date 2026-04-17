@@ -151,10 +151,20 @@ struct SparseSoftmax {
             float sum = row_sum(mi);
             float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
             scores_scale(mi) = inv_sum;
-            row_sum(mi) = (sum == 0.f || sum != sum) ? -INFINITY
-                : row_max(mi) * (softmax_scale_log2 * float(M_LN2)) + __logf(sum);
+            float scaled_max = row_max(mi) * (softmax_scale_log2 * float(M_LN2));
+            float log_sum = (sum == 0.f || sum != sum) ? -INFINITY : __logf(sum);
+            row_max(mi) = scaled_max;
+            row_sum(mi) = log_sum;
         }
         return scores_scale;
+    }
+
+    __forceinline__ __device__ float softmax_max_val(int mi) const {
+        return row_max(mi);
+    }
+
+    __forceinline__ __device__ float softmax_lse_val(int mi) const {
+        return row_sum(mi);
     }
 
     template<typename Tensor1>

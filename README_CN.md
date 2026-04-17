@@ -5,7 +5,7 @@
 融合 Flash Attention、top-k KV block 打分与稀疏注意力的内核库。
 
 - **V1** (`flash_topk_attn`)：单个融合 Triton 内核，在一次 KV 遍历中完成 block 打分、top-k 选取和注意力输出。
-- **V2** (`flash_topk_attn_v2`)：与 V1 相同的 API，**2x–4x 加速**。内部使用模块化的 Triton + CUDA 流水线。
+- **V2** (`flash_topk_attn_v2`)：与 V1 相同的 API，**2x–4x 加速**。内部使用模块化的 Triton + CUDA 流水线。支持反向传播（dQ, dK, dV），由专用 CUDA 内核实现。
 
 ---
 
@@ -128,6 +128,8 @@ o_sparse, lse = flash_topk_attn(
 )
 ```
 
+V2 稀疏注意力支持通过 `torch.autograd` 反向传播。梯度 dQ、dK、dV 由专用 CUTLASS/CuTe CUDA 内核（SM80+）计算，通过反向索引构建（KV-block → Q-blocks）实现高效 dK/dV 累积。
+
 ### 虚拟 Padding
 
 当 N 不能整除 block 大小时，使用 `padding` 指定虚拟 padding。
@@ -183,6 +185,21 @@ V2 在所有配置下比 V1 快 **2x–4x**（RTX 4090, bfloat16）：
 | 1 | 4,096 | 32 | 64 | 64 | 16 | 9.37 ms | 4.47 ms | **2.1x** |
 
 各阶段详细数据：[V2_BENCHMARK_CN.md](V2_BENCHMARK_CN.md)
+
+### V2 稀疏注意力反向传播
+
+CUDA 反向（CUTLASS/CuTe dQ + dKV 内核）vs naive 反向（PyTorch autograd 对密集 masked attention 自动求导）。RTX 3090, bfloat16, `q_block_size=kv_block_size=64`：
+
+| 配置 | CUDA bwd (ms) | Naive total (ms) | 加速比 |
+|:-:|:-:|:-:|:-:|
+| N=256 H=8 D=128 topk=8 | 2.09 | 13.15 | **6x** |
+| N=2048 H=8 D=128 topk=8 | 1.73 | 149.77 | **79x** |
+| N=8192 H=2 D=128 topk=8 | 1.47 | 194.21 | **119x** |
+| N=2048 H=8 D=128 topk=32 | 1.56 | 549.14 | **275x** |
+| N=2048 H=8 D=256 topk=8 | 1.57 | 148.47 | **76x** |
+| B=4 H=8 N=2048 D=128 topk=8 | 1.83 | 575.89 | **249x** |
+
+梯度精度（与 naive 对比，median 绝对误差）：dQ < 2.4e-4, dK < 9.1e-5, dV < 1.3e-3。完整数据：[V2_BENCHMARK_CN.md](V2_BENCHMARK_CN.md)
 
 ### V1 打分 vs 基线
 

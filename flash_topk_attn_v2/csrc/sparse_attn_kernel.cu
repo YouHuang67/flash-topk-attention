@@ -12,7 +12,8 @@ sparse_attn_fwd_kernel(
     const int32_t* __restrict__ merged_indices_ptr,
     const int32_t* __restrict__ counts_ptr,
     Element* __restrict__ o_ptr,
-    float* __restrict__ lse_ptr,
+    float* __restrict__ softmax_max_ptr,
+    float* __restrict__ softmax_lse_ptr,
     int B, int N, int N_phys, int H, int D,
     int QM, int qblock_topk,
     int q_block_size, int kv_block_size,
@@ -41,7 +42,8 @@ sparse_attn_fwd_kernel(
         for (int row = thread_idx; row < q_block_size; row += kNWarps * 32) {
             int const global_row = q_global_start + row;
             if (global_row >= 0 && global_row < N) {
-                lse_ptr[b_idx * H * N + h_idx * N + global_row] = -INFINITY;
+                softmax_max_ptr[b_idx * H * N + h_idx * N + global_row] = -INFINITY;
+                softmax_lse_ptr[b_idx * H * N + h_idx * N + global_row] = -INFINITY;
                 for (int d = 0; d < kHeadDim; d++) {
                     o_ptr[b_idx * stride_o_b + global_row * stride_o_n
                           + h_idx * stride_o_h + d] = Element(0);
@@ -354,8 +356,9 @@ sparse_attn_fwd_kernel(
                 && tile_row < q_row_offset + q_block_size
                 && global_row >= 0
                 && global_row < N) {
-                lse_ptr[b_idx * H * N + h_idx * N + global_row] =
-                    softmax.row_sum(mi);
+                int const lse_offset = b_idx * H * N + h_idx * N + global_row;
+                softmax_max_ptr[lse_offset] = softmax.softmax_max_val(mi);
+                softmax_lse_ptr[lse_offset] = softmax.softmax_lse_val(mi);
             }
         }
     }
@@ -365,7 +368,7 @@ sparse_attn_fwd_kernel(
 void sparse_attn_fwd_launch(
     torch::Tensor q, torch::Tensor k, torch::Tensor v,
     torch::Tensor merged_indices, torch::Tensor counts,
-    torch::Tensor o, torch::Tensor lse,
+    torch::Tensor o, torch::Tensor softmax_max, torch::Tensor softmax_lse,
     int B, int N, int N_phys, int H, int D,
     int QM, int qblock_topk,
     int q_block_size, int kv_block_size,
@@ -414,7 +417,8 @@ void sparse_attn_fwd_launch(
                 merged_indices.data_ptr<int32_t>(),                               \
                 counts.data_ptr<int32_t>(),                                       \
                 reinterpret_cast<Elem*>(o.data_ptr()),                            \
-                lse.data_ptr<float>(),                                            \
+                softmax_max.data_ptr<float>(),                                   \
+                softmax_lse.data_ptr<float>(),                                   \
                 B, N, N_phys, H, D, QM, qblock_topk,                              \
                 q_block_size, kv_block_size,                                      \
                 stride_q_b, stride_q_n, D,                                        \

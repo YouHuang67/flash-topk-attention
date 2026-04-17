@@ -50,10 +50,10 @@ def flash_sparse_attn_cuda(
     kv_block_size: int,
     qblock_topk: int,
     softmax_scale: float,
-    q_pad_head: int = 0,
-    kv_pad_head: int = 0,
+    q_pad_head: int,
+    kv_pad_head: int,
     N_real: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch sparse attention CUDA kernel.
 
     Args:
@@ -73,9 +73,10 @@ def flash_sparse_attn_cuda(
             Defaults to q.shape[1].
 
     Returns:
-        Tuple of (output, lse):
+        Tuple of (output, softmax_max, softmax_lse):
             - output: ``[B, N_real, C]``, same dtype as q.
-            - lse: ``[B, H, N_real]``, float32.
+            - softmax_max: ``[B, H, N_real]``, float32.
+            - softmax_lse: ``[B, H, N_real]``, float32.
     """
     B, N_phys, C = q.shape
     H = num_heads
@@ -88,7 +89,8 @@ def flash_sparse_attn_cuda(
     v_bnhd = v.view(B, N_phys, H, D).contiguous()
 
     output = torch.empty(B, N, H, D, dtype=q.dtype, device=q.device)
-    lse = torch.empty(B, H, N, dtype=torch.float32, device=q.device)
+    softmax_max = torch.empty(B, H, N, dtype=torch.float32, device=q.device)
+    softmax_lse = torch.empty(B, H, N, dtype=torch.float32, device=q.device)
 
     merged_indices = merged_indices.contiguous()
     counts = counts.contiguous()
@@ -96,7 +98,7 @@ def flash_sparse_attn_cuda(
     _get_ext().sparse_attn_fwd_launch(
         q_bnhd, k_bnhd, v_bnhd,
         merged_indices, counts,
-        output, lse,
+        output, softmax_max, softmax_lse,
         B, N, N_phys, H, D,
         QM, qblock_topk,
         q_block_size, kv_block_size,
@@ -105,7 +107,7 @@ def flash_sparse_attn_cuda(
     )
 
     output = output.view(B, N, C)
-    return output, lse
+    return output, softmax_max, softmax_lse
 
 
 __all__ = ["flash_sparse_attn_cuda"]

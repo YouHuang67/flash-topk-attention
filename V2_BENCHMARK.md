@@ -66,3 +66,55 @@ V2 total includes `flash_block_score` + `flash_topk_select` + `flash_qblock_merg
 | 1 | 4,032 | 32 | 128 | 48 | 16 | 37.33 ms | 11.25 ms | **3.3x** |
 | 1 | 5,056 | 32 | 128 | 64 | 16 | 33.97 ms | 11.42 ms | **3.0x** |
 | 1 | 4,096 | 32 | 64 | 64 | 16 | 9.37 ms | 4.47 ms | **2.1x** |
+
+## Sparse Attention Backward
+
+CUDA backward (CUTLASS/CuTe dQ + dKV kernels) vs naive backward (PyTorch autograd on vectorized dense masked attention). RTX 3090, bfloat16, `q_block_size = kv_block_size = 64`. Backward time = total(fwd+bwd) - fwd_only, measured via `triton.testing.do_bench`.
+
+### Varying N (B=1, H=8, D=128, topk=8)
+
+| N | CUDA fwd (ms) | CUDA bwd (ms) | CUDA total (ms) | Naive total (ms) | Speedup |
+|:-:|:-:|:-:|:-:|:-:|:-:|
+| 256 | 0.048 | 2.09 | 2.14 | 13.15 | **6.1x** |
+| 512 | 0.073 | 2.06 | 2.14 | 36.72 | **17.2x** |
+| 1,024 | 0.102 | 1.93 | 2.04 | 71.09 | **34.9x** |
+| 2,048 | 0.159 | 1.73 | 1.89 | 149.77 | **79.4x** |
+| 4,096 (H=4) | 0.159 | 1.96 | 2.12 | 161.02 | **75.9x** |
+| 8,192 (H=2) | 0.159 | 1.47 | 1.63 | 194.21 | **118.9x** |
+
+### Varying topk (B=1, H=8, N=2048, D=128)
+
+| topk | CUDA bwd (ms) | Naive total (ms) | Speedup |
+|:-:|:-:|:-:|:-:|
+| 1 | 1.99 | 27.65 | **13.1x** |
+| 2 | 2.01 | 44.77 | **21.2x** |
+| 4 | 1.95 | 79.56 | **38.2x** |
+| 8 | 1.94 | 149.42 | **71.1x** |
+| 16 | 1.91 | 289.24 | **135.2x** |
+| 32 | 1.56 | 549.14 | **275.3x** |
+
+### Varying D (B=1, H=8, N=2048, topk=8)
+
+| D | CUDA bwd (ms) | Naive total (ms) | Speedup | dq_err | dk_err | dv_err |
+|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| 32 | 2.03 | 146.15 | **69.7x** | 1.0e-04 | 8.7e-05 | 1.2e-03 |
+| 48 | 2.97 | 146.35 | **47.2x** | 1.0e-04 | 7.8e-05 | 1.3e-03 |
+| 64 | 2.04 | 145.70 | **68.2x** | 1.0e-04 | 7.5e-05 | 1.2e-03 |
+| 80 | 2.95 | 151.15 | **48.3x** | 1.0e-04 | 7.1e-05 | 1.2e-03 |
+| 96 | 1.20 | 146.28 | **108.2x** | 1.0e-04 | 6.8e-05 | 1.2e-03 |
+| 128 | 1.94 | 147.80 | **70.5x** | 1.0e-04 | 6.7e-05 | 1.3e-03 |
+| 160 | 1.88 | 146.94 | **70.2x** | 1.0e-04 | 6.5e-05 | 1.2e-03 |
+| 256 | 1.57 | 148.47 | **75.9x** | 1.0e-04 | 6.2e-05 | 1.2e-03 |
+
+### Varying dtype (B=1, H=8, N=2048, D=128, topk=8)
+
+| dtype | CUDA bwd (ms) | Naive total (ms) | Speedup |
+|:-:|:-:|:-:|:-:|
+| bf16 | 1.76 | 148.61 | **77.6x** |
+| fp16 | 1.95 | 151.86 | **72.1x** |
+
+### Summary
+
+- **Speedup range**: 6x (N=256) to 275x (topk=32 dense)
+- **Median speedup**: 70x
+- **Gradient accuracy** (median absolute error vs naive): dQ < 2.4e-4, dK < 9.1e-5, dV < 1.3e-3

@@ -5,7 +5,7 @@ English | [中文](README_CN.md)
 A fused kernel library for Flash Attention with top-k KV block scoring and sparse attention.
 
 - **V1** (`flash_topk_attn`): Single fused Triton kernel that scores KV blocks, selects top-k, and computes attention output in one pass.
-- **V2** (`flash_topk_attn_v2`): Same API as V1, **2x–4x faster**. Internally uses a modular Triton + CUDA pipeline.
+- **V2** (`flash_topk_attn_v2`): Same API as V1, **2x–4x faster**. Internally uses a modular Triton + CUDA pipeline. Supports backward pass (dQ, dK, dV) via custom CUDA kernels.
 
 ---
 
@@ -128,6 +128,8 @@ o_sparse, lse = flash_topk_attn(
 )
 ```
 
+V2 sparse attention supports backward pass via `torch.autograd`. Gradients dQ, dK, dV are computed by dedicated CUTLASS/CuTe CUDA kernels (SM80+), with reverse index construction (KV-block → Q-blocks) for efficient dK/dV accumulation.
+
 ### Virtual Padding
 
 When N is not divisible by block size, use `padding` to specify virtual padding.
@@ -183,6 +185,21 @@ V2 is **2x–4x faster** than V1 across all configurations (RTX 4090, bfloat16):
 | 1 | 4,096 | 32 | 64 | 64 | 16 | 9.37 ms | 4.47 ms | **2.1x** |
 
 Per-stage breakdown: [V2_BENCHMARK.md](V2_BENCHMARK.md)
+
+### V2 Sparse Attention Backward
+
+CUDA backward (CUTLASS/CuTe dQ + dKV kernels) vs naive backward (PyTorch autograd on dense masked attention). RTX 3090, bfloat16, `q_block_size=kv_block_size=64`:
+
+| Config | CUDA bwd (ms) | Naive total (ms) | Speedup |
+|:-:|:-:|:-:|:-:|
+| N=256 H=8 D=128 topk=8 | 2.09 | 13.15 | **6x** |
+| N=2048 H=8 D=128 topk=8 | 1.73 | 149.77 | **79x** |
+| N=8192 H=2 D=128 topk=8 | 1.47 | 194.21 | **119x** |
+| N=2048 H=8 D=128 topk=32 | 1.56 | 549.14 | **275x** |
+| N=2048 H=8 D=256 topk=8 | 1.57 | 148.47 | **76x** |
+| B=4 H=8 N=2048 D=128 topk=8 | 1.83 | 575.89 | **249x** |
+
+Gradient accuracy vs naive (median absolute error): dQ < 2.4e-4, dK < 9.1e-5, dV < 1.3e-3. Full results: [V2_BENCHMARK.md](V2_BENCHMARK.md)
 
 ### V1 Scoring vs Baselines
 
